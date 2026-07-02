@@ -141,6 +141,16 @@ States are pushed two ways:
 
 The conductor sees the same dots you do, so its scheduling decisions naturally reflect which workers are stuck vs. churning.
 
+## Session persistence
+
+peemux automatically saves your layout on quit and restores it on the next launch.
+
+- **Saved on quit** (`Ctrl-b d`) and **autosaved every ~30 seconds** — so closing the terminal window or a crash doesn't wipe your session.
+- **What's restored**: all pane commands (shells, `claude`, `aider`, any `peemux spawn` argument), titles, agent tags, view mode (single vs wall), and active pane.
+- **What isn't restored**: terminal screen contents and scrollback. Processes restart fresh — same behaviour as tmux without tmux-resurrect.
+- Session file lives at `~/Library/Application Support/peemux/session.json` (macOS) or `~/.local/share/peemux/session.json` (Linux).
+- To start a blank session: delete that file before launching.
+
 ## Status
 
 | Milestone | Status |
@@ -150,6 +160,7 @@ The conductor sees the same dots you do, so its scheduling decisions naturally r
 | M1.5 — VT engine swap (vt100 → alacritty_terminal) | ✅ |
 | M2 — Server + UDS + CLI vocabulary | ✅ |
 | M3 — Sidebar + conductor + agent state | ✅ |
+| M3.5 — Session persistence | ✅ |
 | M3+ — Friends list (real peers) | planned |
 | M4 — Polish (config file, bell route, event push) | planned |
 | M5+ — Worktree integration, plugins, Windows | planned |

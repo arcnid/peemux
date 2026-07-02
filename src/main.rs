@@ -15,6 +15,8 @@ use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Stdout, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+
+use directories::ProjectDirs;
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -543,6 +545,9 @@ struct Window {
     /// "aider"). None when it's a plain shell window.
     agent: Option<String>,
     state: AgentState,
+    /// Original spawn command (None = plain $SHELL). Stored so the session
+    /// can re-launch the same process on restore.
+    cmd: Option<String>,
 }
 
 impl Window {
@@ -612,6 +617,7 @@ impl Window {
             alive: true,
             agent: None,
             state: AgentState::None,
+            cmd: None,
         })
     }
 
@@ -674,6 +680,59 @@ struct Toast {
     title: String,
     body: String,
     ts: u64, // unix seconds, for "5s ago" rendering later
+}
+
+// ─── session persistence ─────────────────────────────────────────────────────
+#[derive(Serialize, Deserialize, Debug)]
+struct SessionPane {
+    title: String,
+    cmd: Option<String>,
+    agent: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SessionState {
+    panes: Vec<SessionPane>,
+    active_index: Option<usize>,
+    view: String, // "single" | "wall"
+}
+
+fn session_path() -> Option<PathBuf> {
+    ProjectDirs::from("", "", "peemux")
+        .map(|d| d.data_dir().join("session.json"))
+}
+
+fn save_session(app: &App) {
+    let Some(path) = session_path() else { return };
+    let panes: Vec<SessionPane> = app
+        .windows
+        .iter()
+        .map(|w| SessionPane {
+            title: w.title.clone(),
+            cmd: w.cmd.clone(),
+            agent: w.agent.clone(),
+        })
+        .collect();
+    let state = SessionState {
+        panes,
+        active_index: app.active,
+        view: match app.view {
+            View::Single => "single".into(),
+            View::Wall => "wall".into(),
+        },
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&state) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn load_session() -> Option<SessionState> {
+    let path = session_path()?;
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 struct App {
@@ -997,6 +1056,7 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let mut w = Window::new(id, cmd, rows, cols, self.dirty.clone())?;
+        w.cmd = cmd_override.map(|s| s.to_string());
         // Auto-tag the agent name from the first token of an explicit spawn
         // command — e.g. `peemux spawn claude` → agent=Some("claude"). Plain
         // shell windows (from Ctrl-b c) stay agent=None.
@@ -1416,6 +1476,39 @@ fn main_loop(
 ) -> Result<()> {
     let mut app = App::new();
 
+    // ── session restore ──────────────────────────────────────────────────────
+    if let Some(session) = load_session() {
+        let size = terminal.size().unwrap_or_default();
+        let body = body_rect(size);
+        let (_, main) = split_body(body, &app);
+        let (cols, rows) = (main.width.max(1), main.height.max(1));
+        let n = session.panes.len();
+        for pane in session.panes {
+            if let Ok(id) = app.spawn_window(rows, cols, pane.cmd.as_deref()) {
+                if let Some(idx) = app.find_window_index(id) {
+                    app.windows[idx].title = pane.title;
+                    app.windows[idx].agent = pane.agent;
+                }
+            }
+        }
+        if n > 0 {
+            app.view = match session.view.as_str() {
+                "wall" => View::Wall,
+                _ => View::Single,
+            };
+            if let Some(ai) = session.active_index {
+                if ai < app.windows.len() {
+                    app.active = Some(ai);
+                }
+            }
+            app.show_help = false;
+            app.last_msg = Some(format!(
+                "session restored: {n} pane{}",
+                if n == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
     loop {
         // Each tick: size PTYs to their actual visible area (so wall tiles
         // scroll-follow correctly), then poll children and reap any that
@@ -1447,6 +1540,10 @@ fn main_loop(
         app.tick = app.tick.wrapping_add(1);
         if app.tick % 60 == 0 {
             app.run_heuristics();
+        }
+        // Autosave session every ~30 s so crashes / Cmd+W don't lose layout.
+        if app.tick % 1800 == 1 {
+            save_session(&app);
         }
         app.ack_active();
 
@@ -1487,6 +1584,7 @@ fn main_loop(
         }
 
         if app.quit {
+            save_session(&app);
             // Kill any surviving children so we don't leak processes.
             for w in app.windows.iter_mut() {
                 w.kill();
