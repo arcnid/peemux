@@ -204,6 +204,12 @@ its Bash tool. Designed to be tmux-shaped so it's already familiar.
 - Heuristic detection: blocked/working pattern scan over agent panes (1Hz)
 - `peemux agent state <id> <state>` and `peemux agent list` CLI
 
+### M3.5 — Session persistence ✅
+- `save_session` serializes all pane commands, titles, agent tags, view mode, and active index to `~/Library/Application Support/peemux/session.json` (macOS) / `~/.local/share/peemux/session.json` (Linux)
+- Saved on clean quit (`Ctrl-b d`) and autosaved every ~30 s so force-quit / terminal window close doesn't wipe the session
+- `load_session` on startup re-spawns every pane with its original command; restores view mode and active pane
+- Screen contents and scrollback are not saved (processes restart fresh — same contract as tmux without tmux-resurrect)
+
 ### M3+ — Friends list
 - Wire the placeholder to real peers (fiveHead-core, agent peers)
 
@@ -235,6 +241,4 @@ realistically 2–4 weeks of focused work. The peemux-original wall view
 adds another 1–2 weeks (live mini-renders are non-trivial — likely scaled
 snapshots refreshed at low Hz, not real 60fps tiles).
 
-The C-fork peemux at `~/peemux` is preserved as `peemux-classic` — it
-works, `peemux-notify` is shipped, and it stays available as a fallback
-multiplexer while peemux-rs catches up.
+The C-fork tmux prototype has been deleted. peemux-rs is the only active codebase.

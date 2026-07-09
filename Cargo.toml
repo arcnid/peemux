@@ -43,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Misc
 directories = "5"
 futures = "0.3"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3

@@ -14,6 +14,7 @@
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Stdout, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::raw::c_int;
 use std::path::PathBuf;
 
 use directories::ProjectDirs;
@@ -23,6 +24,12 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static SIGNAL_QUIT: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn on_quit_signal(_: c_int) {
+    SIGNAL_QUIT.store(true, Ordering::Relaxed);
+}
 
 use serde::{Deserialize, Serialize};
 
@@ -702,15 +709,143 @@ fn session_path() -> Option<PathBuf> {
         .map(|d| d.data_dir().join("session.json"))
 }
 
+/// Parse `ps -o etime=` output ([[DD-]HH:]MM:SS) into total seconds.
+fn parse_etime(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let parts: Vec<&str> = s.split(':').collect();
+    match parts.as_slice() {
+        [mm, ss] => Some(mm.parse::<u64>().ok()? * 60 + ss.parse::<u64>().ok()?),
+        [hh_or_dd_hh, mm, ss] => {
+            let (days, hours) = if let Some((d, h)) = hh_or_dd_hh.split_once('-') {
+                (d.parse::<u64>().ok()?, h.parse::<u64>().ok()?)
+            } else {
+                (0, hh_or_dd_hh.parse::<u64>().ok()?)
+            };
+            Some(days * 86400 + hours * 3600 + mm.parse::<u64>().ok()? * 60 + ss.parse::<u64>().ok()?)
+        }
+        _ => None,
+    }
+}
+
+/// Given a running `claude` process PID, find its session ID by:
+/// 1. Getting the process start time from `ps -o etime=`
+/// 2. Mapping the process cwd to ~/.claude/projects/<key>/
+/// 3. Picking the .jsonl file whose birth time falls after the process started
+///    (each claude invocation creates exactly one new session file on startup)
+fn claude_resume_cmd(claude_pid: u32) -> Option<String> {
+    use std::os::macos::fs::MetadataExt;
+
+    // Compute approximate process start time (unix seconds).
+    let etime_out = ProcessCommand::new("ps")
+        .args(["-o", "etime=", "-p", &claude_pid.to_string()])
+        .output()
+        .ok()?;
+    let elapsed = parse_etime(&String::from_utf8_lossy(&etime_out.stdout))?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    // Small fudge factor: session file is created a moment after process start.
+    let process_start = now_secs.saturating_sub(elapsed + 5);
+
+    // Get the process cwd via lsof.
+    let lsof_out = ProcessCommand::new("lsof")
+        .args(["-p", &claude_pid.to_string()])
+        .output()
+        .ok()?;
+    let cwd = String::from_utf8_lossy(&lsof_out.stdout)
+        .lines()
+        .find(|l| l.contains(" cwd "))?
+        .split_whitespace()
+        .last()?
+        .to_string();
+
+    // Map /some/path → -some-path (same scheme claude uses for project dirs).
+    let project_key = cwd.replace('/', "-");
+    let home = std::env::var("HOME").ok()?;
+    let project_dir = std::path::Path::new(&home)
+        .join(".claude/projects")
+        .join(&project_key);
+
+    // Pick the OLDEST session file created after this process started.
+    // Each claude spawns exactly one new .jsonl on startup. min_by_key finds
+    // the file closest in time to this process's start, which is the right one
+    // even when 9 panes all run claude from the same directory.
+    // (max_by_key would always pick the newest file — the wrong session for
+    // every process except the most recently started one.)
+    let candidate = std::fs::read_dir(&project_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+        .filter(|e| {
+            e.metadata()
+                .map(|m| m.st_birthtime() as u64 >= process_start)
+                .unwrap_or(false)
+        })
+        .min_by_key(|e| e.metadata().map(|m| m.st_birthtime() as u64).ok())?;
+
+    let session_id = candidate.path().file_stem()?.to_str()?.to_string();
+    Some(format!("claude -r {session_id}"))
+}
+
+/// Returns the restore command for the foreground process running inside a
+/// shell PTY, or None if the shell is at an idle prompt.
+fn foreground_cmd(shell_pid: u32) -> Option<String> {
+    // `pgrep -P <pid>` lists direct child PIDs of the shell.
+    let kids = ProcessCommand::new("pgrep")
+        .args(["-P", &shell_pid.to_string()])
+        .output()
+        .ok()?;
+    let kid_pids: Vec<u32> = String::from_utf8_lossy(&kids.stdout)
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if kid_pids.is_empty() {
+        return None; // shell is idle
+    }
+    for pid in kid_pids {
+        let out = ProcessCommand::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        let cmd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if cmd.is_empty() {
+            continue;
+        }
+        let argv0 = cmd.split_whitespace().next().unwrap_or("");
+        let base = std::path::Path::new(argv0)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(argv0);
+        if matches!(base, "zsh" | "bash" | "fish" | "sh" | "dash" | "tcsh" | "csh") {
+            continue;
+        }
+        // For claude, find the active session so we can resume it exactly.
+        if base == "claude" {
+            return claude_resume_cmd(pid).or(Some("claude".to_string()));
+        }
+        return Some(cmd);
+    }
+    None
+}
+
 fn save_session(app: &App) {
     let Some(path) = session_path() else { return };
     let panes: Vec<SessionPane> = app
         .windows
         .iter()
-        .map(|w| SessionPane {
-            title: w.title.clone(),
-            cmd: w.cmd.clone(),
-            agent: w.agent.clone(),
+        .map(|w| {
+            // Prefer what's actually running now (gets the claude -r <session_id>
+            // resume command even for panes spawned via `peemux spawn claude`).
+            // Fall back to the stored spawn cmd for idle shells.
+            let cmd = w.child.process_id()
+                .and_then(foreground_cmd)
+                .or_else(|| w.cmd.clone());
+            SessionPane {
+                title: w.title.clone(),
+                cmd,
+                agent: w.agent.clone(),
+            }
         })
         .collect();
     let state = SessionState {
@@ -1453,6 +1588,12 @@ fn run_tui() -> Result<()> {
         ));
     }
 
+    // Save session on SIGTERM (Cmd+Q / kill) and SIGHUP (terminal close).
+    unsafe {
+        libc::signal(libc::SIGTERM, on_quit_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, on_quit_signal as *const () as libc::sighandler_t);
+    }
+
     let (req_tx, req_rx) = mpsc::channel::<ServerRequest>();
     let _cleanup = spawn_server(req_tx)?;
 
@@ -1541,9 +1682,14 @@ fn main_loop(
         if app.tick % 60 == 0 {
             app.run_heuristics();
         }
-        // Autosave session every ~30 s so crashes / Cmd+W don't lose layout.
-        if app.tick % 1800 == 1 {
+        // Autosave every ~5 s so force-kills don't lose layout.
+        if app.tick % 300 == 0 && !app.windows.is_empty() {
             save_session(&app);
+        }
+
+        // SIGTERM / SIGHUP — save then exit cleanly.
+        if SIGNAL_QUIT.load(Ordering::Relaxed) {
+            app.quit = true;
         }
         app.ack_active();
 

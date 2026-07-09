@@ -762,6 +762,7 @@ dependencies = [
  "directories",
  "futures",
  "interprocess",
+ "libc",
  "portable-pty",
  "ratatui",
  "serde",
