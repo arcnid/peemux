@@ -6,6 +6,8 @@ A TUI multiplexer that runs a Claude conductor in the sidebar and orchestrates a
 
 ![peemux running a wall of agents](docs/peemux.png)
 
+![peemux M4 — penguin, friends list, conductor, wall view](docs/peemux-m4.png)
+
 ---
 
 ## What it is
