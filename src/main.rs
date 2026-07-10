@@ -11,6 +11,11 @@
 // - Ctrl-B d        → quit peemux
 // - Active window's PTY renders inside the body; keystrokes forward to the child.
 
+mod dur;
+mod peers;
+mod penguin;
+mod teams;
+
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Stdout, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -173,6 +178,25 @@ asked you to drive; don't type into the user's own shells unprompted.
 
 Keep responses short. The user can see the worker panes themselves — don't
 mirror their output. Focus on coordinating, briefing, and reporting state.
+
+Peer messaging: peemux discovers other peemux users on the Tailscale network.
+When someone is running peemux and connected to the same tailnet, they appear in
+the FRIENDS section of the sidebar with a green dot.
+
+- `peemux peer list` — list discovered peemux peers.
+- `peemux peer send <name> <message>` — send a message to a peer.
+  Use the peer's display name or hostname.
+
+When a peer sends a message, the penguin waves, a notification appears, and the
+sender's name lights up pink in the friends list.
+
+Teams integration is also available for Teams chat notifications:
+- `peemux teams status` — check if Teams is connected.
+- `peemux teams send <chat-id> <message>` — send a Teams chat message.
+
+The penguin in the sidebar is a tomodachi pet. It reacts to agent state (happy
+when an agent finishes, cranky when one is blocked, sleepy when all are working)
+and waves when a notification arrives.
 "#;
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
@@ -222,6 +246,16 @@ enum Command {
         #[command(subcommand)]
         action: AgentAction,
     },
+    /// Teams integration commands.
+    Teams {
+        #[command(subcommand)]
+        action: TeamsAction,
+    },
+    /// Peer discovery and messaging over Tailscale.
+    Peer {
+        #[command(subcommand)]
+        action: PeerAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -230,6 +264,22 @@ enum AgentAction {
     State { pane_id: u64, state: String },
     /// List all panes with attached agents and their states.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum TeamsAction {
+    /// Show Teams auth + connection status.
+    Status,
+    /// Send a message to a Teams chat by chat ID.
+    Send { chat_id: String, message: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum PeerAction {
+    /// List discovered peemux peers on the Tailscale network.
+    List,
+    /// Send a message to a peer by hostname or display name.
+    Send { hostname: String, message: String },
 }
 
 /// Per-pane agent state — the 4-state badge the sidebar dots render. `None`
@@ -296,6 +346,13 @@ struct AgentInfo {
     state: AgentState,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct PeerInfo {
+    hostname: String,
+    display_name: String,
+    has_unread: bool,
+}
+
 // ─── entry ──────────────────────────────────────────────────────────────────
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -327,6 +384,38 @@ fn main() -> Result<()> {
             },
             AgentAction::List => client_run(Request::AgentList),
         },
+        Some(Command::Peer { action }) => match action {
+            PeerAction::List => client_run(Request::PeerList),
+            PeerAction::Send { hostname, message } => {
+                client_run(Request::PeerSend { hostname, text: message })
+            }
+        },
+        Some(Command::Teams { action }) => match action {
+            TeamsAction::Status => {
+                let config = teams::TeamsConfig::from_file();
+                match config {
+                    Some(c) => {
+                        println!("teams: configured (client_id={}…)", &c.client_id[..8]);
+                        println!("poll interval: {}s", c.poll_interval.as_secs());
+                    }
+                    None => println!("teams: not configured — add [teams] to ~/.config/peemux/config.toml"),
+                }
+                Ok(())
+            }
+            TeamsAction::Send { chat_id, message } => {
+                let config = teams::TeamsConfig::from_file()
+                    .ok_or_else(|| anyhow!("teams not configured"))?;
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(async {
+                    let mut client = teams::TeamsClient::new(config);
+                    client.send_message(&chat_id, &message).await?;
+                    println!("sent");
+                    Ok(())
+                })
+            }
+        },
     }
 }
 
@@ -352,6 +441,8 @@ enum Request {
     KillServer,
     AgentState { id: u64, state: AgentState },
     AgentList,
+    PeerList,
+    PeerSend { hostname: String, text: String },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -362,6 +453,7 @@ enum Response {
     Spawned { id: u64, title: String },
     Captured { text: String },
     Agents { agents: Vec<AgentInfo> },
+    PeerList { peers: Vec<PeerInfo> },
     Error { message: String },
 }
 
@@ -439,6 +531,16 @@ fn print_response(req: &Request, resp: &Response) {
                         "{:>4}  {:<20}  {:<8}  {}",
                         a.id, a.title, agent, a.state.label()
                     );
+                }
+            }
+        }
+        (Request::PeerList, Response::PeerList { peers }) => {
+            if peers.is_empty() {
+                println!("(no peers online)");
+            } else {
+                for p in peers {
+                    let unread = if p.has_unread { " (unread)" } else { "" };
+                    println!("  ● {}{}", p.display_name, unread);
                 }
             }
         }
@@ -900,10 +1002,27 @@ struct App {
     focus: Focus,
     /// Frame counter used to throttle agent-state heuristics.
     tick: u64,
+    /// Tomodachi penguin animation player.
+    penguin: dur::DurPlayer,
+    /// Teams integration: contacts with presence.
+    teams_contacts: Vec<teams::Contact>,
+    /// Teams event receiver from background poller.
+    teams_rx: Option<mpsc::Receiver<teams::TeamsEvent>>,
+    /// Device code auth prompt (shown in friends section while pending).
+    teams_auth_prompt: Option<(String, String)>,
+    /// Whether Teams auth has completed.
+    teams_authed: bool,
+    /// Discovered peemux peers (Tailscale).
+    peers: Vec<peers::Peer>,
+    /// Peer event receiver from discovery + listener threads.
+    peers_rx: Option<mpsc::Receiver<peers::PeerEvent>>,
+    /// This user's display name for peer handshakes.
+    my_display_name: String,
 }
 
 impl App {
     fn new() -> Self {
+        let display_name = std::env::var("USER").unwrap_or_else(|_| "anon".into());
         Self {
             windows: Vec::new(),
             active: None,
@@ -922,6 +1041,14 @@ impl App {
             conductor_attempted: false,
             focus: Focus::Workers,
             tick: 0,
+            penguin: dur::DurPlayer::new().expect("embedded .dur files must parse"),
+            teams_contacts: Vec::new(),
+            teams_rx: teams::TeamsConfig::from_file().map(teams::spawn_poller),
+            teams_auth_prompt: None,
+            teams_authed: false,
+            peers: Vec::new(),
+            peers_rx: Some(peers::spawn_peer_system(display_name.clone())),
+            my_display_name: display_name,
         }
     }
 
@@ -988,9 +1115,28 @@ impl App {
                 }
             };
             if new_state != w.state {
+                // Agent just finished → penguin happy (oneshot).
+                if new_state == AgentState::Done && w.state == AgentState::Working {
+                    self.penguin.set_anim(dur::Mood::Happy, dur::AnimMode::Oneshot);
+                }
                 w.state = new_state;
                 self.dirty.store(true, Ordering::Relaxed);
             }
+        }
+
+        // Update penguin default mood based on overall agent fleet state.
+        if self.penguin.mode == dur::AnimMode::Loop {
+            let has_blocked = self.windows.iter().any(|w| w.state == AgentState::Blocked);
+            let all_working = !self.windows.is_empty()
+                && self.windows.iter().filter(|w| w.agent.is_some()).all(|w| w.state == AgentState::Working);
+            let mood = if has_blocked {
+                dur::Mood::Cranky
+            } else if all_working {
+                dur::Mood::Sleepy
+            } else {
+                dur::Mood::Idle
+            };
+            self.penguin.set_default_mood(mood);
         }
     }
 
@@ -1057,6 +1203,13 @@ impl App {
         thread::spawn(move || {
             let _ = ProcessCommand::new("say").arg(&say_body).status();
         });
+        // Penguin reacts to notifications: "feed" source → eating, else wave.
+        let penguin_mood = if source == "feed" {
+            dur::Mood::Eating
+        } else {
+            dur::Mood::Wave
+        };
+        self.penguin.set_anim(penguin_mood, dur::AnimMode::Oneshot);
         self.toasts.push_back(Toast { source, title, body, ts });
         while self.toasts.len() > 50 {
             self.toasts.pop_front();
@@ -1157,6 +1310,39 @@ impl App {
             Request::KillServer => {
                 self.quit = true;
                 Response::Ok
+            }
+            Request::PeerList => {
+                let peers = self
+                    .peers
+                    .iter()
+                    .map(|p| PeerInfo {
+                        hostname: p.hostname.clone(),
+                        display_name: p.display_name.clone(),
+                        has_unread: p.has_unread,
+                    })
+                    .collect();
+                Response::PeerList { peers }
+            }
+            Request::PeerSend { hostname, text } => {
+                let found = self.peers.iter().position(|p| {
+                    p.hostname.eq_ignore_ascii_case(&hostname)
+                        || p.display_name.eq_ignore_ascii_case(&hostname)
+                });
+                match found {
+                    Some(idx) => {
+                        let ip = self.peers[idx].tailscale_ip.clone();
+                        let from = self.my_display_name.clone();
+                        self.peers[idx].has_unread = false;
+                        self.dirty.store(true, Ordering::Relaxed);
+                        thread::spawn(move || {
+                            let _ = peers::send_message(&ip, &from, &text);
+                        });
+                        Response::Ok
+                    }
+                    None => Response::Error {
+                        message: format!("peer '{}' not found", hostname),
+                    },
+                }
             }
         }
     }
@@ -1679,6 +1865,12 @@ fn main_loop(
         // Run the agent-state heuristic roughly once per second (60 ticks at
         // the 16 ms poll cadence). Cheap string-contains checks, not regex.
         app.tick = app.tick.wrapping_add(1);
+
+        // Penguin animation: advance frame based on per-frame delay.
+        if app.penguin.tick(16) {
+            app.dirty.store(true, Ordering::Relaxed);
+        }
+
         if app.tick % 60 == 0 {
             app.run_heuristics();
         }
@@ -1698,6 +1890,87 @@ fn main_loop(
         while let Ok(req) = req_rx.try_recv() {
             let resp = app.dispatch_request(req.req);
             let _ = req.reply.send(resp);
+        }
+
+        // Drain Teams events from the background poller.
+        {
+            let mut events = Vec::new();
+            if let Some(ref rx) = app.teams_rx {
+                while let Ok(ev) = rx.try_recv() {
+                    events.push(ev);
+                }
+            }
+            for ev in events {
+                match ev {
+                    teams::TeamsEvent::ContactsUpdated(contacts) => {
+                        app.teams_contacts = contacts;
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                    teams::TeamsEvent::NewMessage(msg) => {
+                        app.push_toast(
+                            msg.sender_name.clone(),
+                            "Teams".into(),
+                            msg.body.clone(),
+                        );
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                    teams::TeamsEvent::AuthRequired { uri, code } => {
+                        app.teams_auth_prompt = Some((uri, code));
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                    teams::TeamsEvent::AuthComplete => {
+                        app.teams_authed = true;
+                        app.teams_auth_prompt = None;
+                        app.last_msg = Some("teams: signed in".into());
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                    teams::TeamsEvent::Error(msg) => {
+                        app.last_msg = Some(format!("teams: {msg}"));
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        // Drain peer events from Tailscale discovery + listener.
+        {
+            let mut events = Vec::new();
+            if let Some(ref rx) = app.peers_rx {
+                while let Ok(ev) = rx.try_recv() {
+                    events.push(ev);
+                }
+            }
+            for ev in events {
+                match ev {
+                    peers::PeerEvent::PeersUpdated(mut new_peers) => {
+                        for p in new_peers.iter_mut() {
+                            if let Some(existing) =
+                                app.peers.iter().find(|e| e.tailscale_ip == p.tailscale_ip)
+                            {
+                                p.has_unread = existing.has_unread;
+                            }
+                        }
+                        app.peers = new_peers;
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                    peers::PeerEvent::IncomingMessage { from, text } => {
+                        for p in app.peers.iter_mut() {
+                            if p.display_name == from {
+                                p.has_unread = true;
+                            }
+                        }
+                        app.push_toast(
+                            from.clone(),
+                            text.clone(),
+                            format!("Message from {from}: {text}"),
+                        );
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                    peers::PeerEvent::Error(msg) => {
+                        app.last_msg = Some(format!("peers: {msg}"));
+                    }
+                }
+            }
         }
 
         if app.dirty.swap(false, Ordering::Relaxed) {
@@ -1768,6 +2041,7 @@ fn split_body(body: Rect, app: &App) -> (Option<Rect>, Rect) {
 struct SidebarRects {
     header: Rect,
     friends: Rect,
+    penguin: Rect,
     notifs: Rect,
     conductor: Rect,
 }
@@ -1776,17 +2050,19 @@ fn sidebar_rects(sidebar: Rect) -> SidebarRects {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // header
-            Constraint::Length(5), // friends
-            Constraint::Length(5), // notifications
+            Constraint::Length(3),  // header
+            Constraint::Length(5),  // friends
+            Constraint::Length(10), // penguin (8 art + 1 label + 1 pad)
+            Constraint::Length(5),  // notifications
             Constraint::Min(6),    // conductor (greedy)
         ])
         .split(sidebar);
     SidebarRects {
         header: chunks[0],
         friends: chunks[1],
-        notifs: chunks[2],
-        conductor: chunks[3],
+        penguin: chunks[2],
+        notifs: chunks[3],
+        conductor: chunks[4],
     }
 }
 
@@ -2181,22 +2457,51 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
     ];
     f.render_widget(Paragraph::new(header_lines), rects.header);
 
-    // Friends list (M3+ stub — wire to peers in M4).
-    draw_sidebar_section(
-        f,
-        rects.friends,
-        "FRIENDS",
-        vec![
-            Line::from(Span::styled(
-                "  ✦ no peers yet",
-                Style::default().fg(C_DIM).italic(),
-            )),
-            Line::from(Span::styled(
-                "  (M3+)",
-                Style::default().fg(C_DIM).dim(),
-            )),
-        ],
-    );
+    // Friends list — peemux peers discovered over Tailscale.
+    let friend_lines: Vec<Line> = if !app.peers.is_empty() {
+        app.peers
+            .iter()
+            .take(4)
+            .map(|p| {
+                let (dot, dot_color) = if p.has_unread {
+                    ("●", C_PINK)
+                } else {
+                    ("●", C_GREEN)
+                };
+                let name_style = if p.has_unread {
+                    Style::default().fg(C_PINK).bold()
+                } else {
+                    Style::default().fg(C_FG)
+                };
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(dot, Style::default().fg(dot_color)),
+                    Span::raw(" "),
+                    Span::styled(p.display_name.as_str(), name_style),
+                ])
+            })
+            .collect()
+    } else {
+        vec![Line::from(Span::styled(
+            "  ✦ no peers online",
+            Style::default().fg(C_DIM).italic(),
+        ))]
+    };
+    draw_sidebar_section(f, rects.friends, "FRIENDS", friend_lines);
+
+    // Tomodachi penguin (half-block rendered durdraw animation).
+    if rects.penguin.height > 0 {
+        draw_sidebar_section(f, rects.penguin, "TOMODACHI", vec![]);
+        if let Some(frame) = app.penguin.current_frame() {
+            let inner = Rect {
+                x: rects.penguin.x,
+                y: rects.penguin.y + 1,
+                width: rects.penguin.width,
+                height: rects.penguin.height.saturating_sub(1),
+            };
+            f.render_widget(penguin::PenguinWidget { frame }, inner);
+        }
+    }
 
     // Notifications (last 3 toasts, newest first).
     let now = SystemTime::now()
