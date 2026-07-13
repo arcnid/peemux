@@ -299,7 +299,7 @@ git push origin v0.1.0
 | M4 — Tomodachi penguin (durdraw animations) | done |
 | M4.5 — Peer discovery + messaging (Tailscale) | done |
 | M4.6 — Teams integration (Graph API) | done |
-| M5 — Distribution (crates.io + Homebrew tap) | next |
+| M5 — Distribution (crates.io + Homebrew tap) | infra ready, first release pending |
 | M5+ — Named sessions, plugins, Windows | planned |
 
 ## Non-goals
