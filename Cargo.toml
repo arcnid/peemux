@@ -4,6 +4,11 @@ version = "0.0.1"
 edition = "2021"
 description = "The terminal for the agent era — AI coding agent cockpit"
 license = "MIT"
+repository = "https://github.com/arcnid/peemux"
+homepage = "https://github.com/arcnid/peemux"
+keywords = ["terminal", "multiplexer", "tui", "ai", "agent"]
+categories = ["command-line-utilities"]
+readme = "README.md"
 
 [[bin]]
 name = "peemux"
