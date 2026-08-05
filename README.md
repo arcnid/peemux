@@ -89,6 +89,22 @@ peemux peer send tyler "hey"            # send a message (by name or hostname)
 
 When a message arrives, the sender's name lights up in the friends list and the penguin plays a wave animation.
 
+### Pane sharing
+
+Share a live, **read-only** view of any pane with a peemux friend on your tailnet. The viewer sees your pane update in real time; there is no keystroke path back to your terminal.
+
+```bash
+peemux share-pane 2 alice               # share pane 2 with peer "alice"
+# → shared pane 2 with alice — link: peemux://join?host=100.x.y.z&token=Ab3xK9...
+peemux share stop 2                     # stop sharing pane 2 (ends all viewers)
+peemux share list                       # list active outgoing shares + viewers
+peemux share accept                     # accept the newest incoming offer
+```
+
+On the receiving side a toast appears (`tyler wants to share pane "fix-tests" — Ctrl-b y to accept`), the penguin waves, and the sharer's name lights pink. Accept with `Ctrl-b y`, by clicking the offer toast, or with `peemux share accept` (so a conductor agent can accept too). The shared pane shows up as `🔗 fix-tests (tyler)` — a live view sized to the sharer's terminal. `send-keys` to it returns an error; killing it detaches cleanly.
+
+Each share is gated by a random per-share capability token, only explicitly shared panes are reachable, and only while the share is active. Frames are full ANSI screen snapshots streamed over the existing TCP peer channel (~10 fps max, only when the screen changes). Remote panes are never persisted across restarts.
+
 ### Teams integration (optional)
 
 peemux can also connect to Microsoft Teams via the Graph API for chat notifications. Add a `[teams]` section to `~/.config/peemux/config.toml`:
@@ -119,6 +135,7 @@ All bindings use the `Ctrl-b` prefix (tmux-shaped, intentionally familiar).
 | `Ctrl-b w` | Toggle single / wall view |
 | `Ctrl-b Tab` | Toggle sidebar |
 | `Ctrl-b o` | Cycle focus (workers / conductor) |
+| `Ctrl-b y` | Accept the newest pane-share offer |
 | `Ctrl-b &` | Close active pane |
 | `Ctrl-b x` | Force-kill active pane |
 | `Ctrl-b d` | Detach |
@@ -198,7 +215,7 @@ peemux uses Tailscale for zero-config peer discovery:
 4. That peer appears in the friends list with their `$USER` name
 5. Messages flow direct over TCP — no relay, no external service
 
-The wire protocol is newline-delimited JSON: `Hello` (handshake), `Message` (chat), `Ack` (delivery confirmation).
+The wire protocol is newline-delimited JSON: `Hello` (handshake), `Message` (chat), `Ack` (delivery confirmation), plus the pane-sharing messages `ShareOffer`, `JoinShare`, `ShareAccepted`, `PaneFrame`, `ShareEnd`, and `ShareError`. A `JoinShare` connection stays open as the frame stream. Old peemux versions simply drop the message types they don't know.
 
 ## Stack
 
@@ -299,6 +316,7 @@ git push origin v0.1.0
 | M4 — Tomodachi penguin (durdraw animations) | done |
 | M4.5 — Peer discovery + messaging (Tailscale) | done |
 | M4.6 — Teams integration (Graph API) | done |
+| M4.7 — Pane sharing (live read-only views over Tailscale) | done |
 | M5 — Distribution (crates.io + Homebrew tap) | infra ready, first release pending |
 | M5+ — Named sessions, plugins, Windows | planned |
 
