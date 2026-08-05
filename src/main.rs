@@ -98,6 +98,7 @@ const KEYBINDS: &[(&str, &str)] = &[
     ("Ctrl-b  ↑↓←→",  "move active pane (wall view)"),
     ("mouse click",    "focus the pane under the cursor"),
     ("mouse scroll",   "scroll the pane under the cursor"),
+    ("Ctrl-b  y",      "accept a pane-share offer"),
     ("Ctrl-b  x / &",  "force-kill current window"),
     ("exit / Ctrl-d",  "close window from inside the shell"),
     ("Ctrl-b  ?",      "toggle this help"),
@@ -190,6 +191,20 @@ the FRIENDS section of the sidebar with a green dot.
 When a peer sends a message, the penguin waves, a notification appears, and the
 sender's name lights up pink in the friends list.
 
+Pane sharing: a pane can be shared as a live, READ-ONLY view with a peer.
+
+- `peemux share-pane <id> <peer>` — share a pane with a peer. Prints a
+  `peemux://join?...` link; the peer gets an offer toast.
+- `peemux share stop <id>` — stop sharing a pane (disconnects all viewers).
+- `peemux share list` — list active outgoing shares and who is watching.
+- `peemux share accept` — accept the newest incoming share offer (the user
+  can also press Ctrl-b y or click the offer toast). The shared pane appears
+  as a new pane titled `🔗 <title> (<sharer>)`.
+
+Remote (🔗) panes are read-only views of the OTHER person's terminal:
+send-keys to them returns an error, and they are gone when the sharer stops
+sharing. You can capture-pane them to read what the sharer is doing.
+
 Teams integration is also available for Teams chat notifications:
 - `peemux teams status` — check if Teams is connected.
 - `peemux teams send <chat-id> <message>` — send a Teams chat message.
@@ -256,6 +271,24 @@ enum Command {
         #[command(subcommand)]
         action: PeerAction,
     },
+    /// Share a live, read-only view of a pane with a peer. Prints the share link.
+    #[command(name = "share-pane")]
+    SharePane { id: u64, peer: String },
+    /// Manage pane shares (stop/list outgoing, accept incoming).
+    Share {
+        #[command(subcommand)]
+        action: ShareAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ShareAction {
+    /// Stop sharing a pane (ends all viewers).
+    Stop { id: u64 },
+    /// List active outgoing shares and their viewers.
+    List,
+    /// Accept a pending incoming share offer (newest, or by token).
+    Accept { token: Option<String> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -390,6 +423,12 @@ fn main() -> Result<()> {
                 client_run(Request::PeerSend { hostname, text: message })
             }
         },
+        Some(Command::SharePane { id, peer }) => client_run(Request::SharePane { id, peer }),
+        Some(Command::Share { action }) => match action {
+            ShareAction::Stop { id } => client_run(Request::ShareStop { id }),
+            ShareAction::List => client_run(Request::ShareList),
+            ShareAction::Accept { token } => client_run(Request::ShareAccept { token }),
+        },
         Some(Command::Teams { action }) => match action {
             TeamsAction::Status => {
                 let config = teams::TeamsConfig::from_file();
@@ -443,6 +482,11 @@ enum Request {
     AgentList,
     PeerList,
     PeerSend { hostname: String, text: String },
+    SharePane { id: u64, peer: String },
+    ShareStop { id: u64 },
+    ShareList,
+    /// None = accept the newest pending offer.
+    ShareAccept { token: Option<String> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -454,7 +498,18 @@ enum Response {
     Captured { text: String },
     Agents { agents: Vec<AgentInfo> },
     PeerList { peers: Vec<PeerInfo> },
+    Shared { id: u64, peer: String, link: String },
+    ShareList { shares: Vec<ShareInfo> },
     Error { message: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ShareInfo {
+    pane_id: u64,
+    title: String,
+    peer: String,
+    link: String,
+    viewers: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -469,6 +524,10 @@ struct PaneInfo {
 }
 
 fn socket_path() -> PathBuf {
+    // Hidden override for local two-instance testing (pairs with PEEMUX_PORT).
+    if let Ok(p) = std::env::var("PEEMUX_SOCK") {
+        return PathBuf::from(p);
+    }
     let user = std::env::var("USER").unwrap_or_else(|_| "default".into());
     PathBuf::from(format!("/tmp/peemux-{user}.sock"))
 }
@@ -546,6 +605,29 @@ fn print_response(req: &Request, resp: &Response) {
         }
         (Request::Spawn { .. }, Response::Spawned { id, title }) => {
             println!("{id}\t{title}");
+        }
+        (Request::ShareAccept { .. }, Response::Spawned { id, title }) => {
+            println!("attached pane {id}\t{title}");
+        }
+        (Request::SharePane { .. }, Response::Shared { id, peer, link }) => {
+            println!("shared pane {id} with {peer} — link: {link}");
+        }
+        (Request::ShareList, Response::ShareList { shares }) => {
+            if shares.is_empty() {
+                println!("(no active shares)");
+            } else {
+                for s in shares {
+                    let viewers = if s.viewers.is_empty() {
+                        "no viewers yet".to_string()
+                    } else {
+                        format!("watching: {}", s.viewers.join(", "))
+                    };
+                    println!(
+                        "{:>4}  {:<20}  → {:<12}  {}  {}",
+                        s.pane_id, s.title, s.peer, viewers, s.link
+                    );
+                }
+            }
         }
         (Request::CapturePane { .. }, Response::Captured { text }) => {
             print!("{text}");
@@ -640,13 +722,31 @@ struct VtState {
     term: Term<VoidListener>,
 }
 
+/// What feeds a pane's Term. Local panes own a PTY + child process; remote
+/// panes are read-only views of a peer's pane, fed full ANSI frames by a
+/// reader thread that owns the share's TCP stream.
+enum PaneBackend {
+    Pty {
+        master: Box<dyn MasterPty + Send>,
+        writer: Box<dyn Write + Send>,
+        child: Box<dyn Child + Send + Sync>,
+    },
+    Remote {
+        /// Clone of the frame-stream socket, used only to shut it down on
+        /// kill — unblocks the reader thread's blocking read.
+        sock: std::net::TcpStream,
+        /// Cleared by the reader thread on ShareEnd / socket close.
+        alive: Arc<AtomicBool>,
+        /// Sharer's display name (rendered in the pane title).
+        from: String,
+    },
+}
+
 struct Window {
     id: u64,
     title: String,
     vt: Arc<Mutex<VtState>>,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
-    child: Box<dyn Child + Send + Sync>,
+    backend: PaneBackend,
     rows: u16,
     cols: u16,
     alive: bool,
@@ -718,9 +818,7 @@ impl Window {
             id,
             title: format!("win-{id}"),
             vt,
-            master: pair.master,
-            writer,
-            child,
+            backend: PaneBackend::Pty { master: pair.master, writer, child },
             rows,
             cols,
             alive: true,
@@ -730,13 +828,109 @@ impl Window {
         })
     }
 
+    /// Create a read-only remote pane from a joined share. The reader thread
+    /// takes ownership of the frame stream and feeds PaneFrame bytes into the
+    /// same VtState the PTY reader would — rendering needs no changes.
+    fn new_remote(
+        id: u64,
+        joined: peers::JoinedShare,
+        from: String,
+        dirty: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let peers::JoinedShare { mut reader, title, rows, cols } = joined;
+        let sock = reader.get_ref().try_clone()?;
+
+        let config = TermConfig {
+            scrolling_history: 0, // frames are full repaints — no useful scrollback
+            ..TermConfig::default()
+        };
+        let size = TermSize::new(cols as usize, rows as usize);
+        let term = Term::new(config, &size, VoidListener);
+        let parser = AnsiProcessor::new();
+        let vt = Arc::new(Mutex::new(VtState { parser, term }));
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let vt_thread = vt.clone();
+        let dirty_thread = dirty.clone();
+        let alive_thread = alive.clone();
+        thread::spawn(move || {
+            loop {
+                match peers::read_stream_event(&mut reader) {
+                    Ok(Some(peers::StreamEvent::Frame { rows, cols, seq })) => {
+                        if let Ok(mut state) = vt_thread.lock() {
+                            let VtState { parser, term } = &mut *state;
+                            // Track the SHARER's size — local resize never
+                            // touches the source.
+                            if term.screen_lines() != rows as usize
+                                || term.columns() != cols as usize
+                            {
+                                term.resize(TermSize::new(cols as usize, rows as usize));
+                            }
+                            parser.advance(term, seq.as_bytes());
+                        }
+                        dirty_thread.store(true, Ordering::Relaxed);
+                    }
+                    Ok(Some(peers::StreamEvent::End { reason })) => {
+                        // Leave the reason on the dead screen so the viewer
+                        // knows why the feed stopped.
+                        if let Ok(mut state) = vt_thread.lock() {
+                            let VtState { parser, term } = &mut *state;
+                            let bye = format!("\r\n\x1b[0;33m[share ended: {reason}]\x1b[0m");
+                            parser.advance(term, bye.as_bytes());
+                        }
+                        break;
+                    }
+                    Ok(None) => {} // unknown line — skip
+                    Err(_) => break,
+                }
+            }
+            alive_thread.store(false, Ordering::Relaxed);
+            dirty_thread.store(true, Ordering::Relaxed);
+        });
+
+        Ok(Self {
+            id,
+            title: format!("🔗 {title} ({from})"),
+            vt,
+            backend: PaneBackend::Remote { sock, alive, from },
+            rows,
+            cols,
+            alive: true,
+            agent: None,
+            state: AgentState::None,
+            cmd: None,
+        })
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self.backend, PaneBackend::Remote { .. })
+    }
+
+    /// Sharer's display name for Remote panes, None for local ones.
+    fn remote_from(&self) -> Option<&str> {
+        match &self.backend {
+            PaneBackend::Remote { from, .. } => Some(from),
+            PaneBackend::Pty { .. } => None,
+        }
+    }
+
+    /// Child PID for Pty panes; None for remote views.
+    fn process_id(&self) -> Option<u32> {
+        match &self.backend {
+            PaneBackend::Pty { child, .. } => child.process_id(),
+            PaneBackend::Remote { .. } => None,
+        }
+    }
+
     fn resize(&mut self, rows: u16, cols: u16) {
+        // Remote panes stay at the sharer's size — PtyWidget clips/letterboxes.
+        let PaneBackend::Pty { master, .. } = &self.backend else { return };
         if rows == self.rows && cols == self.cols {
             return;
         }
         self.rows = rows;
         self.cols = cols;
-        let _ = self.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+        let _ = master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
         if let Ok(mut state) = self.vt.lock() {
             state.term.resize(TermSize::new(cols as usize, rows as usize));
         }
@@ -749,20 +943,46 @@ impl Window {
     }
 
     fn poll_alive(&mut self) {
-        if self.alive {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                self.alive = false;
+        if !self.alive {
+            return;
+        }
+        match &mut self.backend {
+            PaneBackend::Pty { child, .. } => {
+                if let Ok(Some(_)) = child.try_wait() {
+                    self.alive = false;
+                }
+            }
+            PaneBackend::Remote { alive, .. } => {
+                self.alive = alive.load(Ordering::Relaxed);
+                // Mirror the sharer's current size into the ls/list fields.
+                if let Ok(state) = self.vt.lock() {
+                    self.rows = state.term.screen_lines() as u16;
+                    self.cols = state.term.columns() as u16;
+                }
             }
         }
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        let _ = self.writer.write_all(bytes);
-        let _ = self.writer.flush();
+        // Remote panes are read-only by construction — no write path exists.
+        if let PaneBackend::Pty { writer, .. } = &mut self.backend {
+            let _ = writer.write_all(bytes);
+            let _ = writer.flush();
+        }
     }
 
     fn kill(&mut self) {
-        let _ = self.child.kill();
+        match &mut self.backend {
+            PaneBackend::Pty { child, .. } => {
+                let _ = child.kill();
+            }
+            PaneBackend::Remote { sock, alive, .. } => {
+                // Detach cleanly: closing the socket unblocks the reader
+                // thread; the sharer drops us on its next write.
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+                alive.store(false, Ordering::Relaxed);
+            }
+        }
         self.alive = false;
     }
 }
@@ -789,6 +1009,30 @@ struct Toast {
     title: String,
     body: String,
     ts: u64, // unix seconds, for "5s ago" rendering later
+    /// Set on pane-share offer toasts — clicking the toast accepts the share.
+    share_token: Option<String>,
+}
+
+/// A share offer we've received but not yet accepted (capped at 8, newest
+/// last). Ctrl-b y / toast click / `peemux share accept` consume from here.
+struct PendingShare {
+    from: String,
+    title: String,
+    host: String,
+    token: String,
+}
+
+/// An active outgoing share (sharer side). Stop/viewer state lives in the
+/// peers::ShareRegistry entry keyed by `token`.
+struct OutgoingShare {
+    pane_id: u64,
+    token: String,
+    peer: String,
+    link: String,
+}
+
+fn share_link(host: &str, token: &str) -> String {
+    format!("peemux://join?host={host}&token={token}")
 }
 
 // ─── session persistence ─────────────────────────────────────────────────────
@@ -933,14 +1177,24 @@ fn foreground_cmd(shell_pid: u32) -> Option<String> {
 
 fn save_session(app: &App) {
     let Some(path) = session_path() else { return };
+    // Remote (shared-view) panes are NOT persisted — the share dies with the
+    // connection. Remap active_index onto the filtered list.
+    let active_index = app.active.map(|a| {
+        app.windows
+            .iter()
+            .take(a)
+            .filter(|w| !w.is_remote())
+            .count()
+    });
     let panes: Vec<SessionPane> = app
         .windows
         .iter()
+        .filter(|w| !w.is_remote())
         .map(|w| {
             // Prefer what's actually running now (gets the claude -r <session_id>
             // resume command even for panes spawned via `peemux spawn claude`).
             // Fall back to the stored spawn cmd for idle shells.
-            let cmd = w.child.process_id()
+            let cmd = w.process_id()
                 .and_then(foreground_cmd)
                 .or_else(|| w.cmd.clone());
             SessionPane {
@@ -952,7 +1206,7 @@ fn save_session(app: &App) {
         .collect();
     let state = SessionState {
         panes,
-        active_index: app.active,
+        active_index,
         view: match app.view {
             View::Single => "single".into(),
             View::Wall => "wall".into(),
@@ -1018,11 +1272,23 @@ struct App {
     peers_rx: Option<mpsc::Receiver<peers::PeerEvent>>,
     /// This user's display name for peer handshakes.
     my_display_name: String,
+    /// Our own tailscale IP (refreshed with each discovery poll). Needed to
+    /// build share links; None → sharing unavailable.
+    my_tailscale_ip: Option<String>,
+    /// token → live share state, consulted by the peer listener thread when
+    /// a JoinShare arrives.
+    share_registry: peers::ShareRegistry,
+    /// Outgoing shares (sharer side bookkeeping for share stop/list).
+    shares: Vec<OutgoingShare>,
+    /// Incoming share offers awaiting accept.
+    pending_shares: Vec<PendingShare>,
 }
 
 impl App {
     fn new() -> Self {
         let display_name = std::env::var("USER").unwrap_or_else(|_| "anon".into());
+        let share_registry: peers::ShareRegistry =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         Self {
             windows: Vec::new(),
             active: None,
@@ -1047,8 +1313,12 @@ impl App {
             teams_auth_prompt: None,
             teams_authed: false,
             peers: Vec::new(),
-            peers_rx: Some(peers::spawn_peer_system(display_name.clone())),
+            peers_rx: Some(peers::spawn_peer_system(display_name.clone(), share_registry.clone())),
             my_display_name: display_name,
+            my_tailscale_ip: None,
+            share_registry,
+            shares: Vec::new(),
+            pending_shares: Vec::new(),
         }
     }
 
@@ -1210,12 +1480,183 @@ impl App {
             dur::Mood::Wave
         };
         self.penguin.set_anim(penguin_mood, dur::AnimMode::Oneshot);
-        self.toasts.push_back(Toast { source, title, body, ts });
+        self.toasts.push_back(Toast { source, title, body, ts, share_token: None });
         while self.toasts.len() > 50 {
             self.toasts.pop_front();
         }
         self.last_msg = Some("toast queued".into());
         self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    // ─── pane sharing ────────────────────────────────────────────────────
+
+    /// Record an incoming share offer: pending list (cap 8), actionable
+    /// toast, penguin wave, sharer's friend entry lit pink.
+    fn push_share_offer(&mut self, from: String, title: String, host: String, token: String) {
+        // Re-offers with the same token replace the old entry.
+        self.pending_shares.retain(|p| p.token != token);
+        self.pending_shares.push(PendingShare {
+            from: from.clone(),
+            title: title.clone(),
+            host: host.clone(),
+            token: token.clone(),
+        });
+        while self.pending_shares.len() > 8 {
+            self.pending_shares.remove(0);
+        }
+        for p in self.peers.iter_mut() {
+            if p.display_name == from {
+                p.has_unread = true;
+            }
+        }
+        // Link doubles as a human-readable fallback: visible/copyable even if
+        // the structured accept paths are ever unavailable.
+        let body = format!(
+            "{from} wants to share pane \"{title}\" — Ctrl-b y to accept · {}",
+            share_link(&host, &token)
+        );
+        self.push_toast(from, format!("share: {title}"), body);
+        if let Some(t) = self.toasts.back_mut() {
+            t.share_token = Some(token);
+        }
+    }
+
+    /// Accept a pending share offer — newest when `token` is None. Connects
+    /// to the sharer, does the JoinShare handshake, and turns the open socket
+    /// into a read-only remote pane. Blocking, but bounded by the connect
+    /// (1.5s) + handshake (3s) timeouts.
+    fn accept_share(&mut self, token: Option<&str>) -> Result<u64> {
+        let idx = match token {
+            Some(t) => self
+                .pending_shares
+                .iter()
+                .position(|p| p.token == t)
+                .ok_or_else(|| anyhow!("no pending share with that token"))?,
+            None => self
+                .pending_shares
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| anyhow!("no pending share offers"))?,
+        };
+        let pending = self.pending_shares.remove(idx);
+        let toast_token = pending.token.clone();
+
+        let joined = peers::join_share(&pending.host, &pending.token, &self.my_display_name)
+            .map_err(|e| anyhow!("join {}: {e}", pending.from))?;
+        let id = self.next_id;
+        self.next_id += 1;
+        let w = Window::new_remote(id, joined, pending.from.clone(), self.dirty.clone())?;
+        self.windows.push(w);
+        self.active = Some(self.windows.len() - 1);
+        self.show_help = false;
+        // The offer toast is spent — drop its click action.
+        for t in self.toasts.iter_mut() {
+            if t.share_token.as_deref() == Some(&toast_token) {
+                t.share_token = None;
+            }
+        }
+        self.last_msg = Some(format!("joined {}'s pane \"{}\"", pending.from, pending.title));
+        self.dirty.store(true, Ordering::Relaxed);
+        Ok(id)
+    }
+
+    /// Start sharing pane `id` with peer `peer`. Registers the capability
+    /// token, then offers it to the peer in the background.
+    fn share_pane(&mut self, id: u64, peer_name: &str) -> Result<String> {
+        let host = self
+            .my_tailscale_ip
+            .clone()
+            .ok_or_else(|| anyhow!("tailscale IP unknown — is tailscale running?"))?;
+        let i = self
+            .find_window_index(id)
+            .ok_or_else(|| anyhow!("no pane with id {id}"))?;
+        if self.windows[i].is_remote() {
+            return Err(anyhow!("pane {id} is a shared view — can't re-share it"));
+        }
+        let peer = self
+            .peers
+            .iter()
+            .find(|p| {
+                p.hostname.eq_ignore_ascii_case(peer_name)
+                    || p.display_name.eq_ignore_ascii_case(peer_name)
+            })
+            .ok_or_else(|| anyhow!("peer '{peer_name}' not found"))?;
+        let peer_ip = peer.tailscale_ip.clone();
+        let peer_display = peer.display_name.clone();
+
+        let token = peers::random_token();
+        let title = self.windows[i].title.clone();
+        // Weak: the share must not keep a killed pane's terminal alive — a
+        // failed upgrade reads as "pane closed" in the stream loop.
+        let vt = Arc::downgrade(&self.windows[i].vt);
+        let capture = Arc::new(move || {
+            let vt = vt.upgrade()?;
+            let state = vt.lock().ok()?;
+            Some((
+                state.term.screen_lines() as u16,
+                state.term.columns() as u16,
+                capture_ansi_from_term(&state.term),
+            ))
+        });
+        let entry = peers::ShareEntry {
+            title: title.clone(),
+            capture,
+            stop: Arc::new(AtomicBool::new(false)),
+            viewers: Arc::new(Mutex::new(Vec::new())),
+        };
+        if let Ok(mut reg) = self.share_registry.lock() {
+            reg.insert(token.clone(), entry);
+        }
+        let link = share_link(&host, &token);
+        self.shares.push(OutgoingShare {
+            pane_id: id,
+            token: token.clone(),
+            peer: peer_display.clone(),
+            link: link.clone(),
+        });
+
+        // Deliver the offer off-thread — the peer may be slow/gone. Delivery
+        // failure isn't fatal: the link we return can be passed by hand.
+        let from = self.my_display_name.clone();
+        thread::spawn(move || {
+            let _ = peers::send_share_offer(&peer_ip, &from, &title, &host, &token);
+        });
+        Ok(link)
+    }
+
+    /// Stop all outgoing shares of pane `id`. Viewer loops observe the stop
+    /// flag and send ShareEnd. Returns how many shares ended.
+    fn stop_share(&mut self, pane_id: u64) -> usize {
+        let mut stopped = 0;
+        self.shares.retain(|s| {
+            if s.pane_id != pane_id {
+                return true;
+            }
+            if let Ok(mut reg) = self.share_registry.lock() {
+                if let Some(entry) = reg.remove(&s.token) {
+                    entry.stop.store(true, Ordering::Relaxed);
+                }
+            }
+            stopped += 1;
+            false
+        });
+        stopped
+    }
+
+    /// End shares whose pane no longer exists (killed / exited).
+    fn prune_dead_shares(&mut self) {
+        if self.shares.is_empty() {
+            return;
+        }
+        let dead: Vec<u64> = self
+            .shares
+            .iter()
+            .map(|s| s.pane_id)
+            .filter(|id| self.find_window_index(*id).is_none())
+            .collect();
+        for id in dead {
+            self.stop_share(id);
+        }
     }
 
     fn find_window_index(&self, id: u64) -> Option<usize> {
@@ -1275,6 +1716,15 @@ impl App {
                 }
             }
             Request::SendKeys { id, text } => match self.find_window_index(id) {
+                Some(i) if self.windows[i].is_remote() => Response::Error {
+                    message: format!(
+                        "pane is a read-only shared view{}",
+                        self.windows[i]
+                            .remote_from()
+                            .map(|f| format!(" (shared by {f})"))
+                            .unwrap_or_default()
+                    ),
+                },
                 Some(i) => {
                     self.windows[i].write(text.as_bytes());
                     Response::Ok
@@ -1344,6 +1794,59 @@ impl App {
                     },
                 }
             }
+            Request::SharePane { id, peer } => match self.share_pane(id, &peer) {
+                Ok(link) => Response::Shared { id, peer, link },
+                Err(e) => Response::Error { message: e.to_string() },
+            },
+            Request::ShareStop { id } => {
+                let n = self.stop_share(id);
+                if n > 0 {
+                    self.last_msg = Some(format!("share of pane {id} stopped"));
+                    self.dirty.store(true, Ordering::Relaxed);
+                    Response::Ok
+                } else {
+                    Response::Error { message: format!("pane {id} is not being shared") }
+                }
+            }
+            Request::ShareList => {
+                let shares = self
+                    .shares
+                    .iter()
+                    .map(|s| {
+                        let viewers = self
+                            .share_registry
+                            .lock()
+                            .ok()
+                            .and_then(|reg| {
+                                reg.get(&s.token)
+                                    .and_then(|e| e.viewers.lock().ok().map(|v| v.clone()))
+                            })
+                            .unwrap_or_default();
+                        let title = self
+                            .find_window_index(s.pane_id)
+                            .map(|i| self.windows[i].title.clone())
+                            .unwrap_or_default();
+                        ShareInfo {
+                            pane_id: s.pane_id,
+                            title,
+                            peer: s.peer.clone(),
+                            link: s.link.clone(),
+                            viewers,
+                        }
+                    })
+                    .collect();
+                Response::ShareList { shares }
+            }
+            Request::ShareAccept { token } => match self.accept_share(token.as_deref()) {
+                Ok(id) => {
+                    let title = self
+                        .find_window_index(id)
+                        .map(|i| self.windows[i].title.clone())
+                        .unwrap_or_default();
+                    Response::Spawned { id, title }
+                }
+                Err(e) => Response::Error { message: e.to_string() },
+            },
         }
     }
 
@@ -1637,9 +2140,13 @@ fn capture_pane_text(w: &Window) -> String {
     let Ok(state) = w.vt.lock() else {
         return String::new();
     };
-    let content = state.term.renderable_content();
-    let rows = state.term.screen_lines();
-    let cols = state.term.columns();
+    capture_text_from_term(&state.term)
+}
+
+fn capture_text_from_term(term: &Term<VoidListener>) -> String {
+    let content = term.renderable_content();
+    let rows = term.screen_lines();
+    let cols = term.columns();
     let display_offset = content.display_offset as i32;
     let mut grid: Vec<Vec<char>> = vec![vec![' '; cols]; rows];
     for cell in content.display_iter {
@@ -1669,6 +2176,145 @@ fn capture_pane_text(w: &Window) -> String {
     }
     let mut out = lines.join("\n");
     out.push('\n');
+    out
+}
+
+/// Dump a pane's visible screen as a full-screen ANSI repaint: clear + home,
+/// then per-cell text with SGR emitted only when the style changes, `\r\n`
+/// between rows, and a final cursor position + visibility. Feeding the result
+/// into a fresh same-sized terminal reproduces the screen — this is the
+/// PaneFrame payload for pane sharing.
+#[allow(dead_code)] // thin wrapper mirroring capture_pane_text; shares use the term-level fn
+fn capture_pane_ansi(w: &Window) -> String {
+    let Ok(state) = w.vt.lock() else {
+        return String::new();
+    };
+    capture_ansi_from_term(&state.term)
+}
+
+/// SGR codes for one color, appended as `;3x`/`;4x`-style fragments.
+fn push_sgr_color(out: &mut String, c: AnsiColor, is_fg: bool) {
+    use std::fmt::Write as _;
+    let base = if is_fg { 3 } else { 4 };
+    match c {
+        AnsiColor::Spec(Rgb { r, g, b }) => {
+            let _ = write!(out, ";{base}8;2;{r};{g};{b}");
+        }
+        AnsiColor::Indexed(i) => {
+            let _ = write!(out, ";{base}8;5;{i}");
+        }
+        AnsiColor::Named(n) => match named_to_ratatui(n) {
+            Color::Indexed(i) => {
+                let _ = write!(out, ";{base}8;5;{i}");
+            }
+            // Foreground/Background/Cursor → terminal defaults.
+            _ => {
+                let _ = write!(out, ";{base}9");
+            }
+        },
+    }
+}
+
+fn capture_ansi_from_term(term: &Term<VoidListener>) -> String {
+    // Only the flags that translate to SGR attributes participate in
+    // style-change detection.
+    const SGR_FLAGS: &[(CellFlags, u8)] = &[
+        (CellFlags::BOLD, 1),
+        (CellFlags::DIM, 2),
+        (CellFlags::ITALIC, 3),
+        (CellFlags::UNDERLINE, 4),
+        (CellFlags::INVERSE, 7),
+        (CellFlags::HIDDEN, 8),
+        (CellFlags::STRIKEOUT, 9),
+    ];
+    let sgr_mask: CellFlags = SGR_FLAGS
+        .iter()
+        .fold(CellFlags::empty(), |acc, (f, _)| acc | *f);
+
+    #[derive(Clone, PartialEq)]
+    struct CellStyle {
+        fg: AnsiColor,
+        bg: AnsiColor,
+        flags: CellFlags,
+    }
+    let default_style = CellStyle {
+        fg: AnsiColor::Named(NamedColor::Foreground),
+        bg: AnsiColor::Named(NamedColor::Background),
+        flags: CellFlags::empty(),
+    };
+
+    let content = term.renderable_content();
+    let rows = term.screen_lines();
+    let cols = term.columns();
+    let display_offset = content.display_offset as i32;
+
+    // (char, style); char None = wide-char spacer → emit nothing (the wide
+    // glyph before it already covers this column).
+    let mut grid: Vec<Vec<(Option<char>, CellStyle)>> =
+        vec![vec![(Some(' '), default_style.clone()); cols]; rows];
+    for cell in content.display_iter {
+        let row = cell.point.line.0 + display_offset;
+        if row < 0 || row >= rows as i32 {
+            continue;
+        }
+        let col = cell.point.column.0;
+        if col >= cols {
+            continue;
+        }
+        let slot = &mut grid[row as usize][col];
+        if cell.cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+            slot.0 = None;
+            continue;
+        }
+        let ch = cell.cell.c;
+        *slot = (
+            Some(if ch == '\0' { ' ' } else { ch }),
+            CellStyle {
+                fg: cell.cell.fg,
+                bg: cell.cell.bg,
+                flags: cell.cell.flags & sgr_mask,
+            },
+        );
+    }
+
+    let mut out = String::with_capacity(rows * cols + 64);
+    out.push_str("\x1b[2J\x1b[H");
+    let mut cur: Option<CellStyle> = None;
+    for (r, row_cells) in grid.iter().enumerate() {
+        if r > 0 {
+            out.push_str("\r\n");
+        }
+        for (ch, style) in row_cells {
+            let Some(ch) = ch else { continue };
+            if cur.as_ref() != Some(style) {
+                out.push_str("\x1b[0");
+                for (flag, code) in SGR_FLAGS {
+                    if style.flags.contains(*flag) {
+                        use std::fmt::Write as _;
+                        let _ = write!(out, ";{code}");
+                    }
+                }
+                push_sgr_color(&mut out, style.fg, true);
+                push_sgr_color(&mut out, style.bg, false);
+                out.push('m');
+                cur = Some(style.clone());
+            }
+            out.push(*ch);
+        }
+    }
+    out.push_str("\x1b[0m");
+
+    // Cursor: position (1-based, clamped to the screen) + visibility.
+    let cursor = content.cursor;
+    let crow = (cursor.point.line.0 + display_offset).clamp(0, rows as i32 - 1) as usize;
+    let ccol = cursor.point.column.0.min(cols.saturating_sub(1));
+    use std::fmt::Write as _;
+    let _ = write!(out, "\x1b[{};{}H", crow + 1, ccol + 1);
+    out.push_str(if cursor.shape == CursorShape::Hidden {
+        "\x1b[?25l"
+    } else {
+        "\x1b[?25h"
+    });
     out
 }
 
@@ -1861,6 +2507,8 @@ fn main_loop(
             c.poll_alive();
         }
         app.reap_dead();
+        // Outgoing shares of panes that just died end with a ShareEnd.
+        app.prune_dead_shares();
 
         // Run the agent-state heuristic roughly once per second (60 ticks at
         // the 16 ms poll cadence). Cheap string-contains checks, not regex.
@@ -1942,7 +2590,7 @@ fn main_loop(
             }
             for ev in events {
                 match ev {
-                    peers::PeerEvent::PeersUpdated(mut new_peers) => {
+                    peers::PeerEvent::PeersUpdated { peers: mut new_peers, self_ip } => {
                         for p in new_peers.iter_mut() {
                             if let Some(existing) =
                                 app.peers.iter().find(|e| e.tailscale_ip == p.tailscale_ip)
@@ -1951,7 +2599,13 @@ fn main_loop(
                             }
                         }
                         app.peers = new_peers;
+                        if self_ip.is_some() {
+                            app.my_tailscale_ip = self_ip;
+                        }
                         app.dirty.store(true, Ordering::Relaxed);
+                    }
+                    peers::PeerEvent::ShareOffer { from, title, host, token } => {
+                        app.push_share_offer(from, title, host, token);
                     }
                     peers::PeerEvent::IncomingMessage { from, text } => {
                         for p in app.peers.iter_mut() {
@@ -2213,12 +2867,34 @@ fn handle_mouse_down(app: &mut App, col: u16, row: u16, size: ratatui::layout::S
 
     // Click inside the conductor area focuses the conductor.
     if let Some(sb) = sidebar {
-        let cond_inner = Block::default().borders(Borders::ALL).inner(sidebar_rects(sb).conductor);
+        let rects = sidebar_rects(sb);
+        let cond_inner = Block::default().borders(Borders::ALL).inner(rects.conductor);
         if rect_contains(cond_inner, col, row) {
             if app.conductor.is_some() {
                 app.focus = Focus::Conductor;
                 app.last_msg = Some("focus → conductor".into());
                 app.dirty.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+        // Click on a share-offer toast in NOTIFICATIONS accepts that share.
+        // Row y is the section header; toasts render newest-first below it —
+        // same order as draw_sidebar's `.rev().take(3)`.
+        if rect_contains(rects.notifs, col, row) && row > rects.notifs.y {
+            let nth = (row - rects.notifs.y - 1) as usize;
+            let token = app
+                .toasts
+                .iter()
+                .rev()
+                .nth(nth)
+                .and_then(|t| t.share_token.clone());
+            if let Some(token) = token {
+                if app.pending_shares.iter().any(|p| p.token == token) {
+                    if let Err(e) = app.accept_share(Some(&token)) {
+                        app.last_msg = Some(format!("share accept: {e}"));
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                }
             }
             return;
         }
@@ -2267,6 +2943,16 @@ fn handle_key(app: &mut App, k: KeyEvent) {
             KeyCode::Left => app.move_active_spatial(-1, 0),
             KeyCode::Right => app.move_active_spatial(1, 0),
             KeyCode::Char('&') | KeyCode::Char('x') => app.kill_active(),
+            KeyCode::Char('y') => {
+                // Accept the newest pending pane-share offer.
+                match app.accept_share(None) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        app.last_msg = Some(format!("share accept: {e}"));
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
             KeyCode::Char('?') => {
                 app.show_help = !app.show_help;
                 app.last_msg = Some(if app.show_help { "help on" } else { "help off" }.into());
@@ -2844,5 +3530,94 @@ fn draw_bottom_bar(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(C_ORANGE),
         ));
         f.render_widget(Paragraph::new(right), cols[1]);
+    }
+}
+
+// ─── tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_term(rows: usize, cols: usize) -> (AnsiProcessor, Term<VoidListener>) {
+        let config = TermConfig::default();
+        let size = TermSize::new(cols, rows);
+        (AnsiProcessor::new(), Term::new(config, &size, VoidListener))
+    }
+
+    /// Feed `input` into a source terminal, capture_ansi it, replay the
+    /// capture into a fresh same-sized terminal, and assert the plain-text
+    /// screens match. This is the property the share stream depends on.
+    fn assert_ansi_roundtrip(rows: usize, cols: usize, input: &[u8]) {
+        let (mut p1, mut t1) = fresh_term(rows, cols);
+        p1.advance(&mut t1, input);
+        let ansi = capture_ansi_from_term(&t1);
+
+        let (mut p2, mut t2) = fresh_term(rows, cols);
+        p2.advance(&mut t2, ansi.as_bytes());
+
+        assert_eq!(
+            capture_text_from_term(&t1),
+            capture_text_from_term(&t2),
+            "replayed screen differs for input {input:?}\ncapture: {ansi:?}"
+        );
+    }
+
+    #[test]
+    fn capture_ansi_roundtrips_plain_text() {
+        assert_ansi_roundtrip(5, 20, b"hello world\r\nline two\r\n$ ");
+    }
+
+    #[test]
+    fn capture_ansi_roundtrips_styled_text() {
+        assert_ansi_roundtrip(
+            6,
+            30,
+            b"\x1b[1;31mred bold\x1b[0m plain \x1b[4;38;5;42munderlined\x1b[0m\r\n\
+              \x1b[7mreverse\x1b[27m \x1b[38;2;10;20;30mtruecolor\x1b[0m\r\n",
+        );
+    }
+
+    #[test]
+    fn capture_ansi_roundtrips_wide_chars() {
+        assert_ansi_roundtrip(4, 20, "日本語 ok\r\nペンギン\r\n".as_bytes());
+    }
+
+    #[test]
+    fn capture_ansi_reproduces_cursor_position_and_visibility() {
+        let (mut p1, mut t1) = fresh_term(5, 20);
+        p1.advance(&mut t1, b"abc\r\ndef\x1b[2;2H");
+        let ansi = capture_ansi_from_term(&t1);
+
+        let (mut p2, mut t2) = fresh_term(5, 20);
+        p2.advance(&mut t2, ansi.as_bytes());
+        let c1 = t1.renderable_content().cursor;
+        let c2 = t2.renderable_content().cursor;
+        assert_eq!(c1.point, c2.point);
+        assert_eq!(c1.shape == CursorShape::Hidden, c2.shape == CursorShape::Hidden);
+
+        // Hidden cursor survives the trip too.
+        let (mut p3, mut t3) = fresh_term(5, 20);
+        p3.advance(&mut t3, b"quiet\x1b[?25l");
+        let ansi = capture_ansi_from_term(&t3);
+        let (mut p4, mut t4) = fresh_term(5, 20);
+        p4.advance(&mut t4, ansi.as_bytes());
+        assert_eq!(t4.renderable_content().cursor.shape, CursorShape::Hidden);
+    }
+
+    #[test]
+    fn capture_ansi_starts_with_full_repaint() {
+        let (mut p, mut t) = fresh_term(3, 10);
+        p.advance(&mut t, b"x");
+        let ansi = capture_ansi_from_term(&t);
+        assert!(ansi.starts_with("\x1b[2J\x1b[H"), "must be a full-screen repaint");
+    }
+
+    #[test]
+    fn share_link_format() {
+        assert_eq!(
+            share_link("100.64.0.1", "Ab3xK9"),
+            "peemux://join?host=100.64.0.1&token=Ab3xK9"
+        );
     }
 }
