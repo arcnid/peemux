@@ -1859,6 +1859,11 @@ impl App {
         cols: u16,
         cmd_override: Option<&str>,
     ) -> Result<u64> {
+        // A 0-sized Term panics inside alacritty on the next draw. last_body
+        // can legitimately be 0×0 (headless pty, extreme resize) — clamp here
+        // so every spawn path is safe, not just the keybind one.
+        let rows = rows.max(1);
+        let cols = cols.max(1);
         let mut cmd = match cmd_override {
             Some(c) => {
                 // Run through the user's shell so `peemux spawn "claude --resume"`
