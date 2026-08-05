@@ -1643,6 +1643,22 @@ impl App {
         stopped
     }
 
+    /// Viewer count across pane `id`'s outgoing shares — None when the pane
+    /// isn't shared at all (drives the green border / 📡 badge).
+    fn share_viewers(&self, id: u64) -> Option<usize> {
+        let mut shared = false;
+        let mut viewers = 0;
+        for s in self.shares.iter().filter(|s| s.pane_id == id) {
+            shared = true;
+            if let Ok(reg) = self.share_registry.lock() {
+                if let Some(e) = reg.get(&s.token) {
+                    viewers += e.viewers.lock().map(|v| v.len()).unwrap_or(0);
+                }
+            }
+        }
+        shared.then_some(viewers)
+    }
+
     /// End shares whose pane no longer exists (killed / exited).
     fn prune_dead_shares(&mut self) {
         if self.shares.is_empty() {
@@ -2612,6 +2628,18 @@ fn main_loop(
                     peers::PeerEvent::ShareOffer { from, title, host, token } => {
                         app.push_share_offer(from, title, host, token);
                     }
+                    peers::PeerEvent::ViewerJoined { viewer, title } => {
+                        app.push_toast(
+                            viewer.clone(),
+                            format!("watching: {title}"),
+                            format!("{viewer} is now watching \"{title}\""),
+                        );
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
+                    peers::PeerEvent::ViewerLeft { viewer, title } => {
+                        app.last_msg = Some(format!("{viewer} stopped watching \"{title}\""));
+                        app.dirty.store(true, Ordering::Relaxed);
+                    }
                     peers::PeerEvent::IncomingMessage { from, text } => {
                         for p in app.peers.iter_mut() {
                             if p.display_name == from {
@@ -3071,6 +3099,18 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(w.state.color()).bg(if active { C_PINK } else { C_PANEL }),
                 ));
             }
+            // Shared panes get the 📡 badge on their tab too — single view
+            // has no pane border, so this is the only cue there.
+            if let Some(n) = app.share_viewers(w.id) {
+                let badge = if n > 0 { format!(" 📡{n} ") } else { " 📡 ".to_string() };
+                spans.push(Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(C_GREEN)
+                        .bg(if active { C_PINK } else { C_PANEL })
+                        .bold(),
+                ));
+            }
             let label = format!(" {}:{}{} ", i + 1, w.title, alive_mark);
             spans.push(Span::styled(label, style));
             spans.push(Span::raw(" "));
@@ -3341,7 +3381,16 @@ fn draw_wall(f: &mut Frame, area: Rect, app: &App) {
     for (i, (w, cell)) in app.windows.iter().zip(rects.iter()).enumerate() {
         let cell = *cell;
         let is_active = app.active == Some(i);
-        let border_color = if is_active { C_PINK } else { C_PANEL };
+        // Green border = this pane is live-shared to a peer; beats the
+        // active-pane pink (the title index chip still marks the active pane).
+        let shared = app.share_viewers(w.id);
+        let border_color = if shared.is_some() {
+            C_GREEN
+        } else if is_active {
+            C_PINK
+        } else {
+            C_PANEL
+        };
 
         let alive_mark = if w.alive { "" } else { " ✗" };
         let title_style_idx = if is_active {
@@ -3364,6 +3413,10 @@ fn draw_wall(f: &mut Frame, area: Rect, app: &App) {
                 format!("{} ", w.state.dot()),
                 Style::default().fg(w.state.color()).bold(),
             ));
+        }
+        if let Some(n) = shared {
+            let badge = if n > 0 { format!("📡{n} ") } else { "📡 ".to_string() };
+            title_spans.push(Span::styled(badge, Style::default().fg(C_GREEN).bold()));
         }
         title_spans.push(Span::styled(w.title.clone(), title_style_name));
         title_spans.push(Span::styled(alive_mark, Style::default().fg(Color::Red)));

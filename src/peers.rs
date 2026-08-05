@@ -53,6 +53,10 @@ pub enum PeerEvent {
     /// A peer offered to share a pane with us. `host`/`token` are what we
     /// need to join; the toast + Ctrl-b y flow lives in main.rs.
     ShareOffer { from: String, title: String, host: String, token: String },
+    /// A viewer connected to one of our outgoing shares.
+    ViewerJoined { viewer: String, title: String },
+    /// A viewer disconnected from one of our outgoing shares.
+    ViewerLeft { viewer: String, title: String },
     Error(String),
 }
 
@@ -280,7 +284,7 @@ fn handle_incoming(
             // reachable, only while the share is active.
             let entry = shares.lock().ok().and_then(|m| m.get(&token).cloned());
             match entry {
-                Some(entry) => run_share_stream(writer, entry, user),
+                Some(entry) => run_share_stream(writer, entry, user, tx),
                 None => {
                     let err = Wire::ShareError {
                         message: "invalid or expired share token".into(),
@@ -305,7 +309,12 @@ fn handle_incoming(
 /// again — there is no keystroke path back to the shared PTY. Sends
 /// ShareAccepted, then a PaneFrame whenever the screen hash changes (~10 fps
 /// max), then ShareEnd when the pane dies or the share is stopped.
-fn run_share_stream(mut writer: TcpStream, entry: ShareEntry, viewer: String) {
+fn run_share_stream(
+    mut writer: TcpStream,
+    entry: ShareEntry,
+    viewer: String,
+    tx: &mpsc::Sender<PeerEvent>,
+) {
     writer.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     let send = |w: &mut TcpStream, msg: &Wire| -> Result<()> {
@@ -330,6 +339,10 @@ fn run_share_stream(mut writer: TcpStream, entry: ShareEntry, viewer: String) {
     if let Ok(mut v) = entry.viewers.lock() {
         v.push(viewer.clone());
     }
+    let _ = tx.send(PeerEvent::ViewerJoined {
+        viewer: viewer.clone(),
+        title: entry.title.clone(),
+    });
 
     let mut last_hash: Option<u64> = None;
     loop {
@@ -358,6 +371,10 @@ fn run_share_stream(mut writer: TcpStream, entry: ShareEntry, viewer: String) {
             v.remove(i);
         }
     }
+    let _ = tx.send(PeerEvent::ViewerLeft {
+        viewer,
+        title: entry.title,
+    });
 }
 
 /// Offer a pane share to a peer. One-shot connection, like send_message.
