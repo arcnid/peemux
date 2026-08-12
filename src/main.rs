@@ -43,7 +43,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Point;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config as TermConfig, Term};
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor as AnsiProcessor, Rgb,
 };
@@ -191,19 +191,25 @@ the FRIENDS section of the sidebar with a green dot.
 When a peer sends a message, the penguin waves, a notification appears, and the
 sender's name lights up pink in the friends list.
 
-Pane sharing: a pane can be shared as a live, READ-ONLY view with a peer.
+Pane sharing: a pane can be shared as a live view with a peer. Read-only by
+default; write access lets the viewer type into it (and run commands as you).
 
-- `peemux share-pane <id> <peer>` — share a pane with a peer. Prints a
+- `peemux share-pane <id> <peer>` — share a read-only view. Prints a
   `peemux://join?...` link; the peer gets an offer toast.
+- `peemux share-pane <id> <peer> --write` — share WITH write access: the
+  viewer can type into the pane. Grant/revoke later without re-sharing:
+- `peemux share grant-write <id>` / `peemux share revoke-write <id>` — flip
+  write access on a pane's shares live (viewers see a ✏️ appear/disappear).
 - `peemux share stop <id>` — stop sharing a pane (disconnects all viewers).
-- `peemux share list` — list active outgoing shares and who is watching.
+- `peemux share list` — list active outgoing shares (ro/✏️ rw) and viewers.
 - `peemux share accept` — accept the newest incoming share offer (the user
   can also press Ctrl-b y or click the offer toast). The shared pane appears
   as a new pane titled `🔗 <title> (<sharer>)`.
 
-Remote (🔗) panes are read-only views of the OTHER person's terminal:
-send-keys to them returns an error, and they are gone when the sharer stops
-sharing. You can capture-pane them to read what the sharer is doing.
+Remote (🔗) panes are views of the OTHER person's terminal. Read-only ones
+carry a ✗ on send-keys; if the sharer granted write (✏️ badge), you CAN
+send-keys and type into them — you are driving their pane, so be careful.
+They are gone when the sharer stops sharing. capture-pane works on any of them.
 
 Teams integration is also available for Teams chat notifications:
 - `peemux teams status` — check if Teams is connected.
@@ -271,9 +277,17 @@ enum Command {
         #[command(subcommand)]
         action: PeerAction,
     },
-    /// Share a live, read-only view of a pane with a peer. Prints the share link.
+    /// Share a live view of a pane with a peer. Prints the share link.
+    /// Read-only unless --write is given.
     #[command(name = "share-pane")]
-    SharePane { id: u64, peer: String },
+    SharePane {
+        id: u64,
+        peer: String,
+        /// Let the viewer TYPE into this pane — they can run commands as you.
+        /// Grant/revoke later with `peemux share grant-write` / `revoke-write`.
+        #[arg(long)]
+        write: bool,
+    },
     /// Manage pane shares (stop/list outgoing, accept incoming).
     Share {
         #[command(subcommand)]
@@ -289,6 +303,14 @@ enum ShareAction {
     List,
     /// Accept a pending incoming share offer (newest, or by token).
     Accept { token: Option<String> },
+    /// Let viewers of a pane's shares type into it (they can run commands
+    /// as you). Takes effect live — viewers see a ✏️ and can start typing.
+    #[command(name = "grant-write")]
+    GrantWrite { id: u64 },
+    /// Make a pane's shares read-only again. Viewer keystrokes are dropped
+    /// from this moment; the live view keeps streaming.
+    #[command(name = "revoke-write")]
+    RevokeWrite { id: u64 },
 }
 
 #[derive(Subcommand, Debug)]
@@ -423,11 +445,19 @@ fn main() -> Result<()> {
                 client_run(Request::PeerSend { hostname, text: message })
             }
         },
-        Some(Command::SharePane { id, peer }) => client_run(Request::SharePane { id, peer }),
+        Some(Command::SharePane { id, peer, write }) => {
+            client_run(Request::SharePane { id, peer, write })
+        }
         Some(Command::Share { action }) => match action {
             ShareAction::Stop { id } => client_run(Request::ShareStop { id }),
             ShareAction::List => client_run(Request::ShareList),
             ShareAction::Accept { token } => client_run(Request::ShareAccept { token }),
+            ShareAction::GrantWrite { id } => {
+                client_run(Request::ShareSetWrite { id, writable: true })
+            }
+            ShareAction::RevokeWrite { id } => {
+                client_run(Request::ShareSetWrite { id, writable: false })
+            }
         },
         Some(Command::Teams { action }) => match action {
             TeamsAction::Status => {
@@ -482,11 +512,20 @@ enum Request {
     AgentList,
     PeerList,
     PeerSend { hostname: String, text: String },
-    SharePane { id: u64, peer: String },
+    SharePane {
+        id: u64,
+        peer: String,
+        // Old CLI omits this against a new daemon — default to a read-only
+        // share, never an accidental writable one.
+        #[serde(default)]
+        write: bool,
+    },
     ShareStop { id: u64 },
     ShareList,
     /// None = accept the newest pending offer.
     ShareAccept { token: Option<String> },
+    /// Grant or revoke viewer write access on all of a pane's shares.
+    ShareSetWrite { id: u64, writable: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -498,7 +537,13 @@ enum Response {
     Captured { text: String },
     Agents { agents: Vec<AgentInfo> },
     PeerList { peers: Vec<PeerInfo> },
-    Shared { id: u64, peer: String, link: String },
+    Shared {
+        id: u64,
+        peer: String,
+        link: String,
+        #[serde(default)]
+        writable: bool,
+    },
     ShareList { shares: Vec<ShareInfo> },
     Error { message: String },
 }
@@ -510,6 +555,8 @@ struct ShareInfo {
     peer: String,
     link: String,
     viewers: Vec<String>,
+    #[serde(default)]
+    writable: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -609,8 +656,11 @@ fn print_response(req: &Request, resp: &Response) {
         (Request::ShareAccept { .. }, Response::Spawned { id, title }) => {
             println!("attached pane {id}\t{title}");
         }
-        (Request::SharePane { .. }, Response::Shared { id, peer, link }) => {
+        (Request::SharePane { .. }, Response::Shared { id, peer, link, writable }) => {
             println!("shared pane {id} with {peer} — link: {link}");
+            if *writable {
+                println!("⚠️  write access: {peer} can type into this pane and run commands as you");
+            }
         }
         (Request::ShareList, Response::ShareList { shares }) => {
             if shares.is_empty() {
@@ -622,9 +672,10 @@ fn print_response(req: &Request, resp: &Response) {
                     } else {
                         format!("watching: {}", s.viewers.join(", "))
                     };
+                    let mode = if s.writable { "✏️ rw" } else { "ro" };
                     println!(
-                        "{:>4}  {:<20}  → {:<12}  {}  {}",
-                        s.pane_id, s.title, s.peer, viewers, s.link
+                        "{:>4}  {:<20}  → {:<12}  {:<5}  {}  {}",
+                        s.pane_id, s.title, s.peer, mode, viewers, s.link
                     );
                 }
             }
@@ -732,13 +783,17 @@ enum PaneBackend {
         child: Box<dyn Child + Send + Sync>,
     },
     Remote {
-        /// Clone of the frame-stream socket, used only to shut it down on
+        /// Clone of the frame-stream socket: carries viewer Input up to the
+        /// sharer when the share is writable, and shuts the stream down on
         /// kill — unblocks the reader thread's blocking read.
         sock: std::net::TcpStream,
         /// Cleared by the reader thread on ShareEnd / socket close.
         alive: Arc<AtomicBool>,
         /// Sharer's display name (rendered in the pane title).
         from: String,
+        /// We may type into the sharer's pane. Set at join, and flipped live
+        /// by the reader thread when the sharer grants/revokes (WriteStatus).
+        writable: Arc<AtomicBool>,
     },
 }
 
@@ -828,17 +883,20 @@ impl Window {
         })
     }
 
-    /// Create a read-only remote pane from a joined share. The reader thread
-    /// takes ownership of the frame stream and feeds PaneFrame bytes into the
-    /// same VtState the PTY reader would — rendering needs no changes.
+    /// Create a remote pane from a joined share. The reader thread takes
+    /// ownership of the frame stream and feeds PaneFrame bytes into the same
+    /// VtState the PTY reader would — rendering needs no changes. Writable
+    /// shares route our keystrokes back over the same socket (Window::write).
     fn new_remote(
         id: u64,
         joined: peers::JoinedShare,
         from: String,
         dirty: Arc<AtomicBool>,
     ) -> Result<Self> {
-        let peers::JoinedShare { mut reader, title, rows, cols } = joined;
+        let peers::JoinedShare { mut reader, writer, title, rows, cols, writable } = joined;
+        drop(writer); // sock (same fd) carries input; one handle is enough
         let sock = reader.get_ref().try_clone()?;
+        let writable = Arc::new(AtomicBool::new(writable));
 
         let config = TermConfig {
             scrolling_history: 0, // frames are full repaints — no useful scrollback
@@ -853,9 +911,25 @@ impl Window {
         let vt_thread = vt.clone();
         let dirty_thread = dirty.clone();
         let alive_thread = alive.clone();
+        let writable_thread = writable.clone();
         thread::spawn(move || {
             loop {
                 match peers::read_stream_event(&mut reader) {
+                    Ok(Some(peers::StreamEvent::WriteStatus { writable })) => {
+                        writable_thread.store(writable, Ordering::Relaxed);
+                        // Leave a trace on screen — the next frame repaints
+                        // over it, but the badge flip is the durable cue.
+                        if let Ok(mut state) = vt_thread.lock() {
+                            let VtState { parser, term } = &mut *state;
+                            let note = if writable {
+                                "\r\n\x1b[0;32m[write access granted — you can type]\x1b[0m"
+                            } else {
+                                "\r\n\x1b[0;33m[write access revoked]\x1b[0m"
+                            };
+                            parser.advance(term, note.as_bytes());
+                        }
+                        dirty_thread.store(true, Ordering::Relaxed);
+                    }
                     Ok(Some(peers::StreamEvent::Frame { rows, cols, seq })) => {
                         if let Ok(mut state) = vt_thread.lock() {
                             let VtState { parser, term } = &mut *state;
@@ -892,7 +966,7 @@ impl Window {
             id,
             title: format!("🔗 {title} ({from})"),
             vt,
-            backend: PaneBackend::Remote { sock, alive, from },
+            backend: PaneBackend::Remote { sock, alive, from, writable },
             rows,
             cols,
             alive: true,
@@ -910,6 +984,14 @@ impl Window {
     fn remote_from(&self) -> Option<&str> {
         match &self.backend {
             PaneBackend::Remote { from, .. } => Some(from),
+            PaneBackend::Pty { .. } => None,
+        }
+    }
+
+    /// Some(can_type) for Remote panes, None for local ones.
+    fn remote_writable(&self) -> Option<bool> {
+        match &self.backend {
+            PaneBackend::Remote { writable, .. } => Some(writable.load(Ordering::Relaxed)),
             PaneBackend::Pty { .. } => None,
         }
     }
@@ -942,6 +1024,15 @@ impl Window {
         }
     }
 
+    /// The pane's DECCKM state, for key encoding. Local panes track it from
+    /// the app's own output; remote panes from the sharer's frame trailer.
+    fn app_cursor_mode(&self) -> bool {
+        self.vt
+            .lock()
+            .map(|s| s.term.mode().contains(TermMode::APP_CURSOR))
+            .unwrap_or(false)
+    }
+
     fn poll_alive(&mut self) {
         if !self.alive {
             return;
@@ -964,10 +1055,25 @@ impl Window {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        // Remote panes are read-only by construction — no write path exists.
-        if let PaneBackend::Pty { writer, .. } = &mut self.backend {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
+        match &mut self.backend {
+            PaneBackend::Pty { writer, .. } => {
+                let _ = writer.write_all(bytes);
+                let _ = writer.flush();
+            }
+            PaneBackend::Remote { sock, writable, .. } => {
+                // Writable shares carry keystrokes back to the sharer as one
+                // Input message per call — whole key sequences, never split.
+                // Read-only remotes drop input here (send-keys errors earlier
+                // with a proper message; TUI typing hints in handle_key).
+                if !writable.load(Ordering::Relaxed) {
+                    return;
+                }
+                // Key encodings are always valid UTF-8 (ASCII controls +
+                // typed chars); anything else has no business on the wire.
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    let _ = peers::send_input(sock, text);
+                }
+            }
         }
     }
 
@@ -1029,7 +1135,16 @@ struct OutgoingShare {
     token: String,
     peer: String,
     link: String,
+    /// Shared with the registry entry — flipping it here is what grants or
+    /// revokes live (stream loops watch it and notify viewers).
+    writable: Arc<AtomicBool>,
+    /// Rate-limit window for remote input: (window start, bytes accepted).
+    input_budget: (std::time::Instant, usize),
 }
+
+/// Remote input rate cap per share: generous for typing and send-keys, small
+/// enough to bound a misbehaving peer. Excess input in a window is dropped.
+const REMOTE_INPUT_BYTES_PER_SEC: usize = 64 * 1024;
 
 fn share_link(host: &str, token: &str) -> String {
     format!("peemux://join?host={host}&token={token}")
@@ -1492,7 +1607,14 @@ impl App {
 
     /// Record an incoming share offer: pending list (cap 8), actionable
     /// toast, penguin wave, sharer's friend entry lit pink.
-    fn push_share_offer(&mut self, from: String, title: String, host: String, token: String) {
+    fn push_share_offer(
+        &mut self,
+        from: String,
+        title: String,
+        host: String,
+        token: String,
+        writable: bool,
+    ) {
         // Re-offers with the same token replace the old entry.
         self.pending_shares.retain(|p| p.token != token);
         self.pending_shares.push(PendingShare {
@@ -1511,8 +1633,9 @@ impl App {
         }
         // Link doubles as a human-readable fallback: visible/copyable even if
         // the structured accept paths are ever unavailable.
+        let mode = if writable { " (with ✏️ write access)" } else { "" };
         let body = format!(
-            "{from} wants to share pane \"{title}\" — Ctrl-b y to accept · {}",
+            "{from} wants to share pane \"{title}\"{mode} — Ctrl-b y to accept · {}",
             share_link(&host, &token)
         );
         self.push_toast(from, format!("share: {title}"), body);
@@ -1543,6 +1666,8 @@ impl App {
 
         let joined = peers::join_share(&pending.host, &pending.token, &self.my_display_name)
             .map_err(|e| anyhow!("join {}: {e}", pending.from))?;
+        // Authoritative: the sharer may have flipped write since the offer.
+        let writable = joined.writable;
         let id = self.next_id;
         self.next_id += 1;
         let w = Window::new_remote(id, joined, pending.from.clone(), self.dirty.clone())?;
@@ -1555,14 +1680,19 @@ impl App {
                 t.share_token = None;
             }
         }
-        self.last_msg = Some(format!("joined {}'s pane \"{}\"", pending.from, pending.title));
+        let mode = if writable { " — ✏️ you can type" } else { "" };
+        self.last_msg = Some(format!(
+            "joined {}'s pane \"{}\"{mode}",
+            pending.from, pending.title
+        ));
         self.dirty.store(true, Ordering::Relaxed);
         Ok(id)
     }
 
     /// Start sharing pane `id` with peer `peer`. Registers the capability
-    /// token, then offers it to the peer in the background.
-    fn share_pane(&mut self, id: u64, peer_name: &str) -> Result<String> {
+    /// token, then offers it to the peer in the background. `write` lets the
+    /// viewer type into the pane — grantable/revocable live afterwards.
+    fn share_pane(&mut self, id: u64, peer_name: &str, write: bool) -> Result<String> {
         let host = self
             .my_tailscale_ip
             .clone()
@@ -1598,10 +1728,13 @@ impl App {
                 capture_ansi_from_term(&state.term),
             ))
         });
+        let writable = Arc::new(AtomicBool::new(write));
         let entry = peers::ShareEntry {
             title: title.clone(),
             capture,
             stop: Arc::new(AtomicBool::new(false)),
+            writable: writable.clone(),
+            last_input: Arc::new(Mutex::new(None)),
             viewers: Arc::new(Mutex::new(Vec::new())),
         };
         if let Ok(mut reg) = self.share_registry.lock() {
@@ -1613,15 +1746,75 @@ impl App {
             token: token.clone(),
             peer: peer_display.clone(),
             link: link.clone(),
+            writable,
+            input_budget: (std::time::Instant::now(), 0),
         });
 
         // Deliver the offer off-thread — the peer may be slow/gone. Delivery
         // failure isn't fatal: the link we return can be passed by hand.
         let from = self.my_display_name.clone();
         thread::spawn(move || {
-            let _ = peers::send_share_offer(&peer_ip, &from, &title, &host, &token);
+            let _ = peers::send_share_offer(&peer_ip, &from, &title, &host, &token, write);
         });
         Ok(link)
+    }
+
+    /// Grant/revoke write on all of pane `id`'s shares. Takes effect live:
+    /// stream loops see the flag flip and send WriteStatus to their viewer;
+    /// revoked input is dropped in the peer threads AND re-checked here.
+    fn set_share_writable(&mut self, pane_id: u64, writable: bool) -> usize {
+        let mut n = 0;
+        for s in self.shares.iter().filter(|s| s.pane_id == pane_id) {
+            s.writable.store(writable, Ordering::Relaxed);
+            n += 1;
+        }
+        n
+    }
+
+    /// True when any of pane `id`'s outgoing shares is writable (drives the
+    /// ✏️ badge + orange border on the sharer side).
+    fn share_writable(&self, id: u64) -> bool {
+        self.shares
+            .iter()
+            .any(|s| s.pane_id == id && s.writable.load(Ordering::Relaxed))
+    }
+
+    /// Route one remote keystroke batch into the shared pane it belongs to.
+    /// The peer thread already checked the writable flag; we re-check here
+    /// (revoke wins races), then rate-limit and sanitize before the PTY sees
+    /// a byte.
+    fn route_viewer_input(&mut self, token: &str, viewer: &str, data: &str) {
+        let Some(si) = self.shares.iter().position(|s| s.token == token) else {
+            return; // share ended between send and dispatch
+        };
+        if !self.shares[si].writable.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let (start, used) = self.shares[si].input_budget;
+        let (start, used) = if now.duration_since(start) > Duration::from_secs(1) {
+            (now, 0)
+        } else {
+            (start, used)
+        };
+        if used + data.len() > REMOTE_INPUT_BYTES_PER_SEC {
+            self.shares[si].input_budget = (start, used);
+            self.last_msg = Some(format!("dropping input flood from {viewer}"));
+            self.dirty.store(true, Ordering::Relaxed);
+            return;
+        }
+        self.shares[si].input_budget = (start, used + data.len());
+
+        let pane_id = self.shares[si].pane_id;
+        let bytes = sanitize_remote_input(data);
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(i) = self.find_window_index(pane_id) {
+            self.windows[i].write(&bytes);
+            self.last_msg = Some(format!("✏️ {viewer} → pane {pane_id}"));
+            self.dirty.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Stop all outgoing shares of pane `id`. Viewer loops observe the stop
@@ -1732,7 +1925,9 @@ impl App {
                 }
             }
             Request::SendKeys { id, text } => match self.find_window_index(id) {
-                Some(i) if self.windows[i].is_remote() => Response::Error {
+                // Writable remote panes forward send-keys to the sharer —
+                // same path as TUI typing, so a conductor agent can co-drive.
+                Some(i) if self.windows[i].remote_writable() == Some(false) => Response::Error {
                     message: format!(
                         "pane is a read-only shared view{}",
                         self.windows[i]
@@ -1810,10 +2005,21 @@ impl App {
                     },
                 }
             }
-            Request::SharePane { id, peer } => match self.share_pane(id, &peer) {
-                Ok(link) => Response::Shared { id, peer, link },
+            Request::SharePane { id, peer, write } => match self.share_pane(id, &peer, write) {
+                Ok(link) => Response::Shared { id, peer, link, writable: write },
                 Err(e) => Response::Error { message: e.to_string() },
             },
+            Request::ShareSetWrite { id, writable } => {
+                let n = self.set_share_writable(id, writable);
+                if n > 0 {
+                    let verb = if writable { "granted on" } else { "revoked from" };
+                    self.last_msg = Some(format!("✏️ write {verb} pane {id}'s shares"));
+                    self.dirty.store(true, Ordering::Relaxed);
+                    Response::Ok
+                } else {
+                    Response::Error { message: format!("pane {id} is not being shared") }
+                }
+            }
             Request::ShareStop { id } => {
                 let n = self.stop_share(id);
                 if n > 0 {
@@ -1848,6 +2054,7 @@ impl App {
                             peer: s.peer.clone(),
                             link: s.link.clone(),
                             viewers,
+                            writable: s.writable.load(Ordering::Relaxed),
                         }
                     })
                     .collect();
@@ -2336,6 +2543,22 @@ fn capture_ansi_from_term(term: &Term<VoidListener>) -> String {
     } else {
         "\x1b[?25h"
     });
+
+    // Mode trailer: snapshots repaint cells but wouldn't otherwise carry the
+    // app's input modes. The viewer's Term parses these, so its key encoding
+    // (DECCKM) tracks the sharer's app — vim arrows work over a writable
+    // share. Bracketed paste is mirrored for the same reason.
+    let mode = term.mode();
+    out.push_str(if mode.contains(TermMode::APP_CURSOR) {
+        "\x1b[?1h"
+    } else {
+        "\x1b[?1l"
+    });
+    out.push_str(if mode.contains(TermMode::BRACKETED_PASTE) {
+        "\x1b[?2004h"
+    } else {
+        "\x1b[?2004l"
+    });
     out
 }
 
@@ -2358,7 +2581,109 @@ fn cursor_xy(term: &Term<VoidListener>, area: Rect) -> Option<(u16, u16)> {
 }
 
 // ─── key → PTY bytes ────────────────────────────────────────────────────────
-fn key_to_bytes(k: &KeyEvent) -> Option<Vec<u8>> {
+/// Filter remote viewer input down to things a keyboard can produce before
+/// it touches the shared PTY. Viewers only ever type (their peemux encodes
+/// keys the same way ours does), so anything outside that repertoire is an
+/// injection attempt, a bug, or an exotic key we'd rather lose than forward:
+///
+/// - plain chars, C0 controls (^C, \r, \t…), DEL, and alt-chords (ESC+char)
+///   pass through; C1 control codepoints (U+0080..=U+009F) are stripped — no
+///   keyboard emits them and some apps read them as 8-bit CSI/OSC;
+/// - CSI key sequences pass with a final-byte allowlist; `ESC[200~`/`ESC[201~`
+///   are dropped (numeric param match, so `ESC[0200~` can't sneak past) —
+///   forged bracketed-paste guards let "typed" text masquerade as a paste;
+/// - SS3 keys (app-cursor arrows, F1–F4) pass;
+/// - OSC/DCS/APC/PM/SOS strings are swallowed whole (through ST/BEL): they
+///   are terminal *responses*, never keystrokes — forwarding them would let
+///   a viewer forge query replies (DA/DSR/OSC 52) to sharer-side programs.
+///   Cost: alt-] and alt-shift-P chords are indistinguishable from OSC/DCS
+///   introducers byte-wise and get dropped too.
+///
+/// Best-effort by nature: this runs per Input message, so a peer who splits a
+/// sequence across two messages (`"\x1b"` then `"[201~"`) can still reassemble
+/// it on the PTY — but so can a local user pressing Esc then typing, and write
+/// access is already full command execution. The value here is closing the
+/// low-effort forgeries, not sandboxing a hostile peer you've handed a keyboard.
+fn sanitize_remote_input(data: &str) -> Vec<u8> {
+    // Strip C1 controls first (they arrive as multi-byte UTF-8, e.g. U+009B),
+    // so the byte parser below only ever sees ESC-introduced sequences.
+    let filtered: String = data.chars().filter(|c| !('\u{80}'..='\u{9f}').contains(c)).collect();
+    let mut out = Vec::with_capacity(filtered.len());
+    let bytes = filtered.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != 0x1b {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+        // ESC at the very end = the Esc key itself.
+        let Some(&next) = bytes.get(i + 1) else {
+            out.push(0x1b);
+            break;
+        };
+        match next {
+            b'[' => {
+                // CSI: params, then a final byte.
+                let mut j = i + 2;
+                while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                    j += 1;
+                }
+                let Some(&fin) = bytes.get(j) else { break };
+                let first = bytes[i + 2..j]
+                    .split(|&c| c == b';')
+                    .next()
+                    .and_then(|p| std::str::from_utf8(p).ok())
+                    .and_then(|p| p.parse::<u32>().ok());
+                let paste_guard = fin == b'~' && matches!(first, Some(200) | Some(201));
+                let allowed = matches!(fin, b'A'..=b'D' | b'F' | b'H' | b'Z' | b'~');
+                if allowed && !paste_guard {
+                    out.extend_from_slice(&bytes[i..=j]);
+                }
+                i = j + 1;
+            }
+            b'O' => {
+                // SS3 keys: app-cursor arrows/Home/End + F1-F4.
+                if let Some(&fin) = bytes.get(i + 2) {
+                    if matches!(fin, b'A'..=b'D' | b'H' | b'F' | b'P'..=b'S') {
+                        out.extend_from_slice(&bytes[i..i + 3]);
+                    }
+                    i += 3;
+                } else {
+                    i += 2;
+                }
+            }
+            b']' | b'P' | b'^' | b'_' | b'X' => {
+                // String sequence — swallow through ST (ESC \) or BEL.
+                let mut j = i + 2;
+                while j < bytes.len() {
+                    if bytes[j] == 0x07 || (bytes[j] == 0x1b && bytes.get(j + 1) == Some(&b'\\')) {
+                        j += if bytes[j] == 0x07 { 1 } else { 2 };
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            _ => {
+                // Alt-chord (ESC + char) or a bare Esc keypress followed by
+                // more input — pass the ESC; the next byte(s) flow through
+                // the plain-char path (keeps multi-byte UTF-8 chords whole).
+                out.push(0x1b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Encode a key for a pane's PTY. `app_cursor` = the pane's DECCKM state:
+/// arrows/Home/End emit SS3 (ESC O x) in application mode, CSI otherwise —
+/// full-screen apps (vim, less) set it and expect the SS3 variants. Local
+/// panes read it from their own Term; remote panes learn it from the mode
+/// trailer the sharer appends to every frame.
+fn key_to_bytes(k: &KeyEvent, app_cursor: bool) -> Option<Vec<u8>> {
     use KeyCode::*;
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -2397,12 +2722,12 @@ fn key_to_bytes(k: &KeyEvent) -> Option<Vec<u8>> {
         BackTab => Some(b"\x1b[Z".to_vec()),
         Backspace => Some(vec![0x7f]),
         Esc => Some(vec![0x1b]),
-        Up => Some(b"\x1b[A".to_vec()),
-        Down => Some(b"\x1b[B".to_vec()),
-        Right => Some(b"\x1b[C".to_vec()),
-        Left => Some(b"\x1b[D".to_vec()),
-        Home => Some(b"\x1b[H".to_vec()),
-        End => Some(b"\x1b[F".to_vec()),
+        Up => Some(if app_cursor { b"\x1bOA".to_vec() } else { b"\x1b[A".to_vec() }),
+        Down => Some(if app_cursor { b"\x1bOB".to_vec() } else { b"\x1b[B".to_vec() }),
+        Right => Some(if app_cursor { b"\x1bOC".to_vec() } else { b"\x1b[C".to_vec() }),
+        Left => Some(if app_cursor { b"\x1bOD".to_vec() } else { b"\x1b[D".to_vec() }),
+        Home => Some(if app_cursor { b"\x1bOH".to_vec() } else { b"\x1b[H".to_vec() }),
+        End => Some(if app_cursor { b"\x1bOF".to_vec() } else { b"\x1b[F".to_vec() }),
         PageUp => Some(b"\x1b[5~".to_vec()),
         PageDown => Some(b"\x1b[6~".to_vec()),
         Insert => Some(b"\x1b[2~".to_vec()),
@@ -2625,8 +2950,11 @@ fn main_loop(
                         }
                         app.dirty.store(true, Ordering::Relaxed);
                     }
-                    peers::PeerEvent::ShareOffer { from, title, host, token } => {
-                        app.push_share_offer(from, title, host, token);
+                    peers::PeerEvent::ShareOffer { from, title, host, token, writable } => {
+                        app.push_share_offer(from, title, host, token, writable);
+                    }
+                    peers::PeerEvent::ViewerInput { token, viewer, data } => {
+                        app.route_viewer_input(&token, &viewer, &data);
                     }
                     peers::PeerEvent::ViewerJoined { viewer, title } => {
                         app.push_toast(
@@ -3014,20 +3342,31 @@ fn handle_key(app: &mut App, k: KeyEvent) {
 
     // Forward to whichever PTY currently owns focus. Conductor wins when
     // the sidebar is visible and the user has focused it; otherwise we fall
-    // back to the active worker.
-    let Some(bytes) = key_to_bytes(&k) else { return };
+    // back to the active worker. Encoding consults the target's terminal
+    // modes, so pick the target before rendering the key to bytes.
     let routed_to_conductor = app.focus == Focus::Conductor
         && app.sidebar_visible
         && app.conductor.is_some();
     if routed_to_conductor {
         if let Some(w) = app.conductor.as_mut() {
-            w.write(&bytes);
+            if let Some(bytes) = key_to_bytes(&k, w.app_cursor_mode()) {
+                w.write(&bytes);
+            }
         }
         return;
     }
     if let Some(i) = app.active {
         if let Some(w) = app.windows.get_mut(i) {
-            w.write(&bytes);
+            if w.remote_writable() == Some(false) {
+                // Typing into a read-only view goes nowhere — say so instead
+                // of silently eating keys.
+                let from = w.remote_from().unwrap_or("peer").to_string();
+                app.last_msg = Some(format!("read-only view of {from}'s pane"));
+                return;
+            }
+            if let Some(bytes) = key_to_bytes(&k, w.app_cursor_mode()) {
+                w.write(&bytes);
+            }
         }
     }
 }
@@ -3100,13 +3439,25 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
                 ));
             }
             // Shared panes get the 📡 badge on their tab too — single view
-            // has no pane border, so this is the only cue there.
+            // has no pane border, so this is the only cue there. ✏️ marks
+            // write access: on our shares (a viewer can type here!) and on
+            // remote panes we can type into.
             if let Some(n) = app.share_viewers(w.id) {
-                let badge = if n > 0 { format!(" 📡{n} ") } else { " 📡 ".to_string() };
+                let pen = if app.share_writable(w.id) { "✏️" } else { "" };
+                let badge = if n > 0 { format!(" 📡{pen}{n} ") } else { format!(" 📡{pen} ") };
                 spans.push(Span::styled(
                     badge,
                     Style::default()
-                        .fg(C_GREEN)
+                        .fg(if pen.is_empty() { C_GREEN } else { C_ORANGE })
+                        .bg(if active { C_PINK } else { C_PANEL })
+                        .bold(),
+                ));
+            }
+            if w.remote_writable() == Some(true) {
+                spans.push(Span::styled(
+                    " ✏️ ",
+                    Style::default()
+                        .fg(C_ORANGE)
                         .bg(if active { C_PINK } else { C_PANEL })
                         .bold(),
                 ));
@@ -3381,10 +3732,14 @@ fn draw_wall(f: &mut Frame, area: Rect, app: &App) {
     for (i, (w, cell)) in app.windows.iter().zip(rects.iter()).enumerate() {
         let cell = *cell;
         let is_active = app.active == Some(i);
-        // Green border = this pane is live-shared to a peer; beats the
+        // Green border = this pane is live-shared to a peer; orange = shared
+        // WITH WRITE ACCESS (someone else can type here). Both beat the
         // active-pane pink (the title index chip still marks the active pane).
         let shared = app.share_viewers(w.id);
-        let border_color = if shared.is_some() {
+        let shared_writable = shared.is_some() && app.share_writable(w.id);
+        let border_color = if shared_writable {
+            C_ORANGE
+        } else if shared.is_some() {
             C_GREEN
         } else if is_active {
             C_PINK
@@ -3415,8 +3770,13 @@ fn draw_wall(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
         if let Some(n) = shared {
-            let badge = if n > 0 { format!("📡{n} ") } else { "📡 ".to_string() };
-            title_spans.push(Span::styled(badge, Style::default().fg(C_GREEN).bold()));
+            let pen = if shared_writable { "✏️" } else { "" };
+            let badge = if n > 0 { format!("📡{pen}{n} ") } else { format!("📡{pen} ") };
+            let color = if shared_writable { C_ORANGE } else { C_GREEN };
+            title_spans.push(Span::styled(badge, Style::default().fg(color).bold()));
+        }
+        if w.remote_writable() == Some(true) {
+            title_spans.push(Span::styled("✏️ ", Style::default().fg(C_ORANGE).bold()));
         }
         title_spans.push(Span::styled(w.title.clone(), title_style_name));
         title_spans.push(Span::styled(alive_mark, Style::default().fg(Color::Red)));
@@ -3624,6 +3984,77 @@ mod tests {
     #[test]
     fn capture_ansi_roundtrips_plain_text() {
         assert_ansi_roundtrip(5, 20, b"hello world\r\nline two\r\n$ ");
+    }
+
+    /// The mode trailer must carry DECCKM to the viewer's Term — that is
+    /// what makes arrow keys encode correctly over a writable share.
+    #[test]
+    fn capture_ansi_carries_app_cursor_mode() {
+        let (mut p1, mut t1) = fresh_term(4, 20);
+        p1.advance(&mut t1, b"\x1b[?1hvim-ish");
+        assert!(t1.mode().contains(TermMode::APP_CURSOR));
+        let ansi = capture_ansi_from_term(&t1);
+
+        let (mut p2, mut t2) = fresh_term(4, 20);
+        p2.advance(&mut t2, ansi.as_bytes());
+        assert!(t2.mode().contains(TermMode::APP_CURSOR));
+
+        // And back off again.
+        p1.advance(&mut t1, b"\x1b[?1l");
+        let ansi = capture_ansi_from_term(&t1);
+        p2.advance(&mut t2, ansi.as_bytes());
+        assert!(!t2.mode().contains(TermMode::APP_CURSOR));
+    }
+
+    #[test]
+    fn key_encoding_tracks_app_cursor_mode() {
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(key_to_bytes(&up, false).unwrap(), b"\x1b[A");
+        assert_eq!(key_to_bytes(&up, true).unwrap(), b"\x1bOA");
+        // Non-cursor keys are mode-independent.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(key_to_bytes(&enter, true).unwrap(), b"\r");
+    }
+
+    #[test]
+    fn sanitize_passes_keyboard_repertoire() {
+        // Plain typing, submits, control chords, unicode.
+        assert_eq!(sanitize_remote_input("ls -la\r"), b"ls -la\r");
+        assert_eq!(sanitize_remote_input("\x03"), b"\x03"); // ctrl-c
+        assert_eq!(sanitize_remote_input("héllo 🐧"), "héllo 🐧".as_bytes());
+        // Arrow keys, both encodings; F-keys; nav keys.
+        assert_eq!(sanitize_remote_input("\x1b[A\x1bOB"), b"\x1b[A\x1bOB");
+        assert_eq!(sanitize_remote_input("\x1bOP\x1b[15~"), b"\x1bOP\x1b[15~");
+        assert_eq!(sanitize_remote_input("\x1b[5~\x1b[3~\x1b[Z"), b"\x1b[5~\x1b[3~\x1b[Z");
+        // Modified arrows (ctrl-right) keep their params.
+        assert_eq!(sanitize_remote_input("\x1b[1;5C"), b"\x1b[1;5C");
+        // Alt-chord and a bare Esc.
+        assert_eq!(sanitize_remote_input("\x1bf"), b"\x1bf");
+        assert_eq!(sanitize_remote_input("\x1b"), b"\x1b");
+    }
+
+    #[test]
+    fn sanitize_blocks_injection_sequences() {
+        // Forged bracketed-paste guards — the CVE-2021-31701 class. The
+        // guards are stripped; the text between them stays ordinary typing.
+        assert_eq!(sanitize_remote_input("\x1b[200~evil\x1b[201~"), b"evil");
+        assert_eq!(sanitize_remote_input("safe\x1b[201~injected"), b"safeinjected");
+        // Forged terminal responses: OSC 52 clipboard write, DCS, APC —
+        // swallowed whole through their terminators.
+        assert_eq!(sanitize_remote_input("a\x1b]52;c;ZXZpbA==\x07b"), b"ab");
+        assert_eq!(sanitize_remote_input("a\x1b]0;title\x1b\\b"), b"ab");
+        assert_eq!(sanitize_remote_input("a\x1bPq...payload\x1b\\b"), b"ab");
+        assert_eq!(sanitize_remote_input("a\x1b_apc\x1b\\b"), b"ab");
+        // CSI with a disallowed final (cursor-position report forgery) is
+        // consumed, not forwarded.
+        assert_eq!(sanitize_remote_input("a\x1b[12;34Rb"), b"ab");
+        // Unterminated string sequence: swallowed to end, nothing leaks.
+        assert_eq!(sanitize_remote_input("a\x1b]52;c;steal"), b"a");
+        // Leading-zero param must not slip the paste-guard filter.
+        assert_eq!(sanitize_remote_input("\x1b[0200~x\x1b[00201~"), b"x");
+        // C1 controls (here U+009B = 8-bit CSI) are stripped, so they can't
+        // act as an 8-bit introducer; surrounding plain chars are unaffected.
+        assert_eq!(sanitize_remote_input("a\u{9b}201~b"), b"a201~b");
     }
 
     #[test]

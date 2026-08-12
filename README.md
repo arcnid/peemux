@@ -91,19 +91,24 @@ When a message arrives, the sender's name lights up in the friends list and the 
 
 ### Pane sharing
 
-Share a live, **read-only** view of any pane with a peemux friend on your tailnet. The viewer sees your pane update in real time; there is no keystroke path back to your terminal.
+Share a live view of any pane with a peemux friend on your tailnet. **Read-only by default** — the viewer sees your pane update in real time with no keystroke path back. Add `--write` (or grant it later) to let them type into the pane too.
 
 ```bash
-peemux share-pane 2 alice               # share pane 2 with peer "alice"
+peemux share-pane 2 alice               # share pane 2 read-only with peer "alice"
 # → shared pane 2 with alice — link: peemux://join?host=100.x.y.z&token=Ab3xK9...
+peemux share-pane 2 alice --write        # share WITH write access (alice can type)
+peemux share grant-write 2              # grant write on pane 2's shares (live)
+peemux share revoke-write 2             # revoke write again — back to read-only
 peemux share stop 2                     # stop sharing pane 2 (ends all viewers)
-peemux share list                       # list active outgoing shares + viewers
+peemux share list                       # list active shares (ro / ✏️ rw) + viewers
 peemux share accept                     # accept the newest incoming offer
 ```
 
-On the receiving side a toast appears (`tyler wants to share pane "fix-tests" — Ctrl-b y to accept`), the penguin waves, and the sharer's name lights pink. Accept with `Ctrl-b y`, by clicking the offer toast, or with `peemux share accept` (so a conductor agent can accept too). The shared pane shows up as `🔗 fix-tests (tyler)` — a live view sized to the sharer's terminal. `send-keys` to it returns an error; killing it detaches cleanly.
+On the receiving side a toast appears (`tyler wants to share pane "fix-tests" — Ctrl-b y to accept`), the penguin waves, and the sharer's name lights pink. Accept with `Ctrl-b y`, by clicking the offer toast, or with `peemux share accept` (so a conductor agent can accept too). The shared pane shows up as `🔗 fix-tests (tyler)` — a live view sized to the sharer's terminal. Killing it detaches cleanly.
 
-Each share is gated by a random per-share capability token, only explicitly shared panes are reachable, and only while the share is active. Frames are full ANSI screen snapshots streamed over the existing TCP peer channel (~10 fps max, only when the screen changes). Remote panes are never persisted across restarts.
+**Write access.** When a share is writable, the viewer's keystrokes stream back into the sharer's PTY over the same connection — they are co-driving your terminal and can run any command you can. Both sides are marked clearly: the sharer's pane border turns **orange** with a `📡✏️` badge, and the viewer's remote pane shows a `✏️` badge. Grant/revoke takes effect live (the viewer sees `[write access granted]` / `[write access revoked]`); revoked keystrokes are dropped immediately. Read-only remote panes still reject `send-keys` with an error; writable ones accept it, so a conductor agent can co-drive too. Keystrokes are sanitized before they touch the PTY (forged bracketed-paste guards and terminal-response sequences are stripped) and rate-capped per viewer.
+
+Each share is gated by a random per-share capability token, only explicitly shared panes are reachable, and only while the share is active. Write is never on unless you asked for it, and defaults safe across mixed peemux versions. Frames are full ANSI screen snapshots streamed over the existing TCP peer channel (~10 fps idle, briefly ~30 fps right after remote input so keystrokes echo quickly). Remote panes are never persisted across restarts.
 
 ### Teams integration (optional)
 
@@ -215,7 +220,7 @@ peemux uses Tailscale for zero-config peer discovery:
 4. That peer appears in the friends list with their `$USER` name
 5. Messages flow direct over TCP — no relay, no external service
 
-The wire protocol is newline-delimited JSON: `Hello` (handshake), `Message` (chat), `Ack` (delivery confirmation), plus the pane-sharing messages `ShareOffer`, `JoinShare`, `ShareAccepted`, `PaneFrame`, `ShareEnd`, and `ShareError`. A `JoinShare` connection stays open as the frame stream. Old peemux versions simply drop the message types they don't know.
+The wire protocol is newline-delimited JSON: `Hello` (handshake), `Message` (chat), `Ack` (delivery confirmation), plus the pane-sharing messages `ShareOffer`, `JoinShare`, `ShareAccepted`, `PaneFrame`, `ShareEnd`, and `ShareError`. A `JoinShare` connection stays open as the frame stream. Write access adds two messages on that same stream — `Input` (viewer → sharer keystrokes) and `WriteStatus` (sharer → viewer grant/revoke) — plus a `writable` flag on `ShareOffer`/`ShareAccepted` that defaults to `false`, so a share is never writable unless both peers speak the newer protocol and the sharer opted in. Old peemux versions simply drop the message types and fields they don't know.
 
 ## Stack
 

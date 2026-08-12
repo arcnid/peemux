@@ -24,6 +24,19 @@ const DISCOVERY_INTERVAL: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Cadence of the sharer-side frame poll: capture, hash, send-if-changed.
 const FRAME_INTERVAL: Duration = Duration::from_millis(100);
+/// Faster poll right after remote input, so the viewer sees their own
+/// keystrokes echo without waiting out the idle cadence.
+const FRAME_INTERVAL_HOT: Duration = Duration::from_millis(33);
+/// How long one remote keystroke keeps the frame poll in the hot cadence.
+const INPUT_HOT_WINDOW: Duration = Duration::from_millis(1500);
+/// Hard cap on a single viewer input message. Enforced on the READ itself
+/// (not after buffering) so a peer can't stream an unbounded newline-less
+/// line and OOM the sharer. A line over this drops the connection.
+const MAX_INPUT_LINE: usize = 32 * 1024;
+/// Coarse per-connection input rate cap, enforced in the sharer's input
+/// thread BEFORE events hit the unbounded channel — so a flood is dropped at
+/// ingest, not after ballooning the queue. main.rs re-checks per pane.
+const MAX_INPUT_BYTES_PER_SEC: usize = 64 * 1024;
 
 /// TCP port for peer traffic. `PEEMUX_PORT` env overrides the default —
 /// hidden knob so two instances can coexist on one box for local testing.
@@ -52,11 +65,14 @@ pub enum PeerEvent {
     IncomingMessage { from: String, text: String },
     /// A peer offered to share a pane with us. `host`/`token` are what we
     /// need to join; the toast + Ctrl-b y flow lives in main.rs.
-    ShareOffer { from: String, title: String, host: String, token: String },
+    ShareOffer { from: String, title: String, host: String, token: String, writable: bool },
     /// A viewer connected to one of our outgoing shares.
     ViewerJoined { viewer: String, title: String },
     /// A viewer disconnected from one of our outgoing shares.
     ViewerLeft { viewer: String, title: String },
+    /// A viewer typed into one of our writable shares. main.rs sanitizes and
+    /// routes the bytes into the pane's PTY — the peer threads never touch it.
+    ViewerInput { token: String, viewer: String, data: String },
     Error(String),
 }
 
@@ -75,6 +91,12 @@ pub struct ShareEntry {
     pub capture: Arc<dyn Fn() -> Option<(u16, u16, String)> + Send + Sync>,
     /// Set true to end the share — every viewer loop sends ShareEnd and closes.
     pub stop: Arc<AtomicBool>,
+    /// Viewers may type into the shared PTY. Flipped live by grant-write /
+    /// revoke-write; stream loops notice and send WriteStatus to viewers.
+    pub writable: Arc<AtomicBool>,
+    /// Last time a viewer typed — drives the hot frame cadence so remote
+    /// keystrokes echo fast. None until the first input.
+    pub last_input: Arc<Mutex<Option<std::time::Instant>>>,
     /// Display names of connected viewers (for `peemux share list`).
     pub viewers: Arc<Mutex<Vec<String>>>,
 }
@@ -112,15 +134,35 @@ enum Wire {
     Message { from: String, text: String },
     Ack,
     // Pane sharing. All additive — old peers fail to parse the unknown
-    // `type` tag, drop the connection, and are otherwise unaffected.
-    ShareOffer { from: String, title: String, host: String, token: String },
+    // `type` tag, drop the connection, and are otherwise unaffected. New
+    // FIELDS on existing tags use #[serde(default)] so old sharers (who
+    // omit them) still parse; serde ignores unknown fields on old viewers.
+    ShareOffer {
+        from: String,
+        title: String,
+        host: String,
+        token: String,
+        #[serde(default)]
+        writable: bool,
+    },
     /// Sent by a viewer; the connection then STAYS OPEN as the frame stream.
     JoinShare { token: String, user: String },
-    ShareAccepted { title: String, rows: u16, cols: u16 },
+    ShareAccepted {
+        title: String,
+        rows: u16,
+        cols: u16,
+        #[serde(default)]
+        writable: bool,
+    },
     /// Full ANSI screen snapshot of the shared pane.
     PaneFrame { rows: u16, cols: u16, seq: String },
     ShareEnd { reason: String },
     ShareError { message: String },
+    /// Viewer → sharer on the frame-stream connection: keystrokes for the
+    /// shared PTY (UTF-8; key encodings are plain-text-safe in JSON).
+    Input { data: String },
+    /// Sharer → viewer: write access granted/revoked mid-share.
+    WriteStatus { writable: bool },
 }
 
 // ─── tailscale status JSON ────────────────────────────────────────────────
@@ -274,17 +316,19 @@ fn handle_incoming(
             writer.flush()?;
             let _ = tx.send(PeerEvent::IncomingMessage { from, text });
         }
-        Wire::ShareOffer { from, title, host, token } => {
+        Wire::ShareOffer { from, title, host, token, writable } => {
             writeln!(writer, "{}", serde_json::to_string(&Wire::Ack)?)?;
             writer.flush()?;
-            let _ = tx.send(PeerEvent::ShareOffer { from, title, host, token });
+            let _ = tx.send(PeerEvent::ShareOffer { from, title, host, token, writable });
         }
         Wire::JoinShare { token, user } => {
             // Token is the capability: only explicitly shared panes are
             // reachable, only while the share is active.
             let entry = shares.lock().ok().and_then(|m| m.get(&token).cloned());
             match entry {
-                Some(entry) => run_share_stream(writer, entry, user, tx),
+                // The reader rides along: viewer Input lines may already sit
+                // in its buffer, so the stream loop must reuse it, not re-clone.
+                Some(entry) => run_share_stream(writer, reader, entry, token, user, tx),
                 None => {
                     let err = Wire::ShareError {
                         message: "invalid or expired share token".into(),
@@ -299,19 +343,25 @@ fn handle_incoming(
         | Wire::ShareAccepted { .. }
         | Wire::PaneFrame { .. }
         | Wire::ShareEnd { .. }
-        | Wire::ShareError { .. } => {}
+        | Wire::ShareError { .. }
+        | Wire::Input { .. }
+        | Wire::WriteStatus { .. } => {}
     }
     Ok(())
 }
 
 /// Per-viewer streaming loop, run on the JoinShare connection's own thread.
-/// Read-only by construction: after JoinShare we never read from the socket
-/// again — there is no keystroke path back to the shared PTY. Sends
-/// ShareAccepted, then a PaneFrame whenever the screen hash changes (~10 fps
-/// max), then ShareEnd when the pane dies or the share is stopped.
+/// Sends ShareAccepted, then a PaneFrame whenever the screen hash changes
+/// (~10 fps idle, ~30 fps briefly after remote input), then ShareEnd when the
+/// pane dies or the share is stopped. A companion reader thread drains viewer
+/// Input lines from the same socket — they only ever become ViewerInput
+/// events for main.rs to sanitize and route; peer threads never touch a PTY.
+/// While the share is not writable, viewer input is dropped here.
 fn run_share_stream(
     mut writer: TcpStream,
+    reader: BufReader<TcpStream>,
     entry: ShareEntry,
+    token: String,
     viewer: String,
     tx: &mpsc::Sender<PeerEvent>,
 ) {
@@ -327,9 +377,15 @@ fn run_share_stream(
         let _ = send(&mut writer, &Wire::ShareEnd { reason: "pane closed".into() });
         return;
     };
+    let mut last_writable = entry.writable.load(Ordering::Relaxed);
     if send(
         &mut writer,
-        &Wire::ShareAccepted { title: entry.title.clone(), rows, cols },
+        &Wire::ShareAccepted {
+            title: entry.title.clone(),
+            rows,
+            cols,
+            writable: last_writable,
+        },
     )
     .is_err()
     {
@@ -344,11 +400,85 @@ fn run_share_stream(
         title: entry.title.clone(),
     });
 
+    // Set true by the input thread when the viewer's socket closes, so the
+    // write loop tears down promptly even on an idle pane (it otherwise only
+    // notices a departed viewer on its next failed frame send).
+    let gone = Arc::new(AtomicBool::new(false));
+
+    // Input reader: blocks on the socket; exits on EOF/error. The write loop
+    // below shuts the socket down when the share ends, which unblocks us.
+    let input_thread = {
+        let mut reader = reader;
+        let writable = entry.writable.clone();
+        let last_input = entry.last_input.clone();
+        let gone = gone.clone();
+        let tx = tx.clone();
+        let token = token.clone();
+        let viewer = viewer.clone();
+        thread::spawn(move || {
+            // handle_incoming set a 5s handshake timeout — the stream is
+            // long-lived and quiet from here, so block indefinitely.
+            reader.get_ref().set_read_timeout(None).ok();
+            let mut line = String::new();
+            let mut win_start = std::time::Instant::now();
+            let mut win_used = 0usize;
+            loop {
+                line.clear();
+                // Bound the read itself — a line over the cap (or with no
+                // newline) means an oversized/hostile message: drop the peer.
+                let n = {
+                    let mut limited = (&mut reader).take(MAX_INPUT_LINE as u64 + 1);
+                    limited.read_line(&mut line)
+                };
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if !line.ends_with('\n') => break,
+                    Ok(_) => {}
+                }
+                let Ok(Wire::Input { data }) = serde_json::from_str::<Wire>(line.trim()) else {
+                    continue; // unknown/other lines — skip
+                };
+                if !writable.load(Ordering::Relaxed) {
+                    continue; // read-only (or revoked) — input is dropped here
+                }
+                // Coarse rate cap at ingest so a flood never enters the channel.
+                let now = std::time::Instant::now();
+                if now.duration_since(win_start) > Duration::from_secs(1) {
+                    win_start = now;
+                    win_used = 0;
+                }
+                if win_used + data.len() > MAX_INPUT_BYTES_PER_SEC {
+                    continue;
+                }
+                win_used += data.len();
+                if let Ok(mut t) = last_input.lock() {
+                    *t = Some(now);
+                }
+                let _ = tx.send(PeerEvent::ViewerInput {
+                    token: token.clone(),
+                    viewer: viewer.clone(),
+                    data,
+                });
+            }
+            gone.store(true, Ordering::Relaxed);
+        })
+    };
+
     let mut last_hash: Option<u64> = None;
     loop {
         if entry.stop.load(Ordering::Relaxed) {
             let _ = send(&mut writer, &Wire::ShareEnd { reason: "share stopped".into() });
             break;
+        }
+        if gone.load(Ordering::Relaxed) {
+            break; // viewer's socket closed — the input thread saw it first
+        }
+        let writable = entry.writable.load(Ordering::Relaxed);
+        if writable != last_writable {
+            last_writable = writable;
+            if send(&mut writer, &Wire::WriteStatus { writable }).is_err() {
+                break;
+            }
         }
         let Some((rows, cols, seq)) = (entry.capture)() else {
             let _ = send(&mut writer, &Wire::ShareEnd { reason: "pane closed".into() });
@@ -363,8 +493,18 @@ fn run_share_stream(
                 break; // viewer went away — drop silently
             }
         }
-        thread::sleep(FRAME_INTERVAL);
+        let hot = entry
+            .last_input
+            .lock()
+            .ok()
+            .and_then(|t| *t)
+            .is_some_and(|t| t.elapsed() < INPUT_HOT_WINDOW);
+        thread::sleep(if hot { FRAME_INTERVAL_HOT } else { FRAME_INTERVAL });
     }
+
+    // Unblock the input reader's blocking read_line, then reap it.
+    let _ = writer.shutdown(std::net::Shutdown::Both);
+    let _ = input_thread.join();
 
     if let Ok(mut v) = entry.viewers.lock() {
         if let Some(i) = v.iter().position(|u| u == &viewer) {
@@ -384,6 +524,7 @@ pub fn send_share_offer(
     title: &str,
     host: &str,
     token: &str,
+    writable: bool,
 ) -> Result<()> {
     let addr: SocketAddr = format!("{peer_ip}:{}", peemux_port()).parse()?;
     let stream = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT)?;
@@ -397,6 +538,7 @@ pub fn send_share_offer(
         title: title.to_string(),
         host: host.to_string(),
         token: token.to_string(),
+        writable,
     };
     writeln!(writer, "{}", serde_json::to_string(&msg)?)?;
     writer.flush()?;
@@ -408,12 +550,16 @@ pub fn send_share_offer(
 
 /// A successfully joined share: the handshake is done and `reader` is the
 /// live frame stream (ShareAccepted consumed; PaneFrames/ShareEnd follow).
-/// The reader must be kept — frames may already sit in its buffer.
+/// The reader must be kept — frames may already sit in its buffer. `writer`
+/// is the same socket's write half, kept for Input when the share is writable
+/// (write access can also be granted later via WriteStatus).
 pub struct JoinedShare {
     pub reader: BufReader<TcpStream>,
+    pub writer: TcpStream,
     pub title: String,
     pub rows: u16,
     pub cols: u16,
+    pub writable: bool,
 }
 
 /// Connect to a sharer and join a share. Blocking (bounded by the connect +
@@ -435,12 +581,16 @@ pub fn join_share(host: &str, token: &str, user: &str) -> Result<JoinedShare> {
     let mut line = String::new();
     reader.read_line(&mut line)?;
     match serde_json::from_str::<Wire>(line.trim()) {
-        Ok(Wire::ShareAccepted { title, rows, cols }) => {
+        Ok(Wire::ShareAccepted { title, rows, cols, writable }) => {
             // Handshake done — the stream is long-lived from here. Frames can
             // be sparse (only on change), so drop the read timeout; pane kill
-            // shuts the socket down to unblock the reader thread.
+            // shuts the socket down to unblock the reader thread. Bound WRITES
+            // though: send_input runs on the TUI main thread, so a wedged
+            // sharer must not be able to freeze the viewer's whole UI on a
+            // full send buffer — a timed-out write just drops the keystroke.
             reader.get_ref().set_read_timeout(None).ok();
-            Ok(JoinedShare { reader, title, rows, cols })
+            reader.get_ref().set_write_timeout(Some(Duration::from_secs(5))).ok();
+            Ok(JoinedShare { reader, writer, title, rows, cols, writable })
         }
         Ok(Wire::ShareError { message }) => Err(anyhow!("share refused: {message}")),
         Ok(_) => Err(anyhow!("unexpected reply from sharer")),
@@ -453,6 +603,7 @@ pub fn join_share(host: &str, token: &str, user: &str) -> Result<JoinedShare> {
 pub enum StreamEvent {
     Frame { rows: u16, cols: u16, seq: String },
     End { reason: String },
+    WriteStatus { writable: bool },
 }
 
 /// Blocking read of the next stream event. Ok(None) = unknown line (skip).
@@ -467,8 +618,19 @@ pub fn read_stream_event(reader: &mut BufReader<TcpStream>) -> Result<Option<Str
         Ok(Wire::PaneFrame { rows, cols, seq }) => Ok(Some(StreamEvent::Frame { rows, cols, seq })),
         Ok(Wire::ShareEnd { reason }) => Ok(Some(StreamEvent::End { reason })),
         Ok(Wire::ShareError { message }) => Ok(Some(StreamEvent::End { reason: message })),
+        Ok(Wire::WriteStatus { writable }) => Ok(Some(StreamEvent::WriteStatus { writable })),
         _ => Ok(None),
     }
+}
+
+/// Viewer → sharer: send keystrokes up a writable share's stream socket.
+/// Called from the TUI main thread only; one whole message per call so a
+/// key's escape sequence can never interleave with another writer's bytes.
+pub fn send_input(sock: &TcpStream, data: &str) -> Result<()> {
+    let mut w = sock;
+    writeln!(w, "{}", serde_json::to_string(&Wire::Input { data: data.to_string() })?)?;
+    w.flush()?;
+    Ok(())
 }
 
 /// Send a message to a peer. Blocking — call from a background thread.
@@ -511,12 +673,18 @@ mod tests {
             title: "fix-tests".into(),
             host: "100.64.0.1".into(),
             token: "Ab3xK9Ab3xK9Ab3xK9Ab3xK9".into(),
+            writable: true,
         });
         roundtrip(Wire::JoinShare {
             token: "Ab3xK9Ab3xK9Ab3xK9Ab3xK9".into(),
             user: "alice".into(),
         });
-        roundtrip(Wire::ShareAccepted { title: "fix-tests".into(), rows: 50, cols: 140 });
+        roundtrip(Wire::ShareAccepted {
+            title: "fix-tests".into(),
+            rows: 50,
+            cols: 140,
+            writable: false,
+        });
         roundtrip(Wire::PaneFrame {
             rows: 2,
             cols: 5,
@@ -524,6 +692,25 @@ mod tests {
         });
         roundtrip(Wire::ShareEnd { reason: "pane closed".into() });
         roundtrip(Wire::ShareError { message: "invalid or expired share token".into() });
+        roundtrip(Wire::Input { data: "ls -la\r".into() });
+        roundtrip(Wire::Input { data: "\x1b[A\x03".into() }); // arrows + ctrl-c survive JSON
+        roundtrip(Wire::WriteStatus { writable: true });
+    }
+
+    #[test]
+    fn old_sharer_messages_default_to_read_only() {
+        // A pre-write-access sharer omits `writable` — must parse as false,
+        // never fail, so mixed-version shares stay read-only-safe.
+        let accepted: Wire = serde_json::from_str(
+            r#"{"type":"shareaccepted","title":"t","rows":10,"cols":20}"#,
+        )
+        .unwrap();
+        assert!(matches!(accepted, Wire::ShareAccepted { writable: false, .. }));
+        let offer: Wire = serde_json::from_str(
+            r#"{"type":"shareoffer","from":"t","title":"x","host":"h","token":"k"}"#,
+        )
+        .unwrap();
+        assert!(matches!(offer, Wire::ShareOffer { writable: false, .. }));
     }
 
     #[test]
@@ -558,6 +745,8 @@ mod tests {
             title: "fix-tests".into(),
             capture: Arc::new(|| Some((3, 10, "\x1b[2J\x1b[Hhello".to_string()))),
             stop: stop.clone(),
+            writable: Arc::new(AtomicBool::new(false)),
+            last_input: Arc::new(Mutex::new(None)),
             viewers: Arc::new(Mutex::new(Vec::new())),
         };
         let registry: ShareRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -631,5 +820,91 @@ mod tests {
             Wire::ShareError { .. }
         ));
         server.join().unwrap();
+    }
+
+    /// Write path end-to-end: viewer Input on a writable share surfaces as
+    /// ViewerInput; revoking write streams WriteStatus{false} to the viewer
+    /// and drops subsequent input; input while read-only never surfaces.
+    #[test]
+    fn writable_share_routes_input_and_revokes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writable = Arc::new(AtomicBool::new(true));
+        let entry = ShareEntry {
+            title: "pair".into(),
+            capture: Arc::new(|| Some((3, 10, "\x1b[2J\x1b[Hhello".to_string()))),
+            stop: stop.clone(),
+            writable: writable.clone(),
+            last_input: Arc::new(Mutex::new(None)),
+            viewers: Arc::new(Mutex::new(Vec::new())),
+        };
+        let registry: ShareRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry.lock().unwrap().insert("tokw".into(), entry);
+
+        let (tx, rx) = mpsc::channel();
+        let reg_srv = registry.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = handle_incoming(stream, "sharer", &tx, &reg_srv);
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+
+        let join = Wire::JoinShare { token: "tokw".into(), user: "alice".into() };
+        writeln!(writer, "{}", serde_json::to_string(&join).unwrap()).unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Wire>(line.trim()).unwrap(),
+            Wire::ShareAccepted { writable: true, .. }
+        ));
+
+        // Viewer types — the sharer side must surface it as ViewerInput.
+        let input = Wire::Input { data: "echo hi\r".into() };
+        writeln!(writer, "{}", serde_json::to_string(&input).unwrap()).unwrap();
+        let ev = rx
+            .iter()
+            .find(|e| matches!(e, PeerEvent::ViewerInput { .. }))
+            .unwrap();
+        match ev {
+            PeerEvent::ViewerInput { token, viewer, data } => {
+                assert_eq!(token, "tokw");
+                assert_eq!(viewer, "alice");
+                assert_eq!(data, "echo hi\r");
+            }
+            _ => unreachable!(),
+        }
+
+        // Revoke write — the viewer is told over the stream.
+        writable.store(false, Ordering::Relaxed);
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            match serde_json::from_str::<Wire>(line.trim()).unwrap() {
+                Wire::WriteStatus { writable } => {
+                    assert!(!writable);
+                    break;
+                }
+                Wire::PaneFrame { .. } => continue, // initial frame may precede it
+                other => panic!("expected WriteStatus, got {other:?}"),
+            }
+        }
+
+        // Input after revoke is dropped on the sharer side.
+        let input = Wire::Input { data: "rm -rf /\r".into() };
+        writeln!(writer, "{}", serde_json::to_string(&input).unwrap()).unwrap();
+        thread::sleep(Duration::from_millis(250));
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+        let leaked = rx
+            .try_iter()
+            .any(|e| matches!(e, PeerEvent::ViewerInput { .. }));
+        assert!(!leaked, "input after revoke must not surface");
     }
 }

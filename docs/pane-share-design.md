@@ -139,14 +139,43 @@ enum PaneBackend {
   while the share is active. Sharer validates token on JoinShare.
 - Trust boundary remains the tailnet (matches existing peers design). The
   share is offered to a named peer but the token is the gate.
-- Read-only by construction: the streaming loop never reads input from the
-  viewer socket after JoinShare; there is no keystroke path back to the PTY.
+- Read-only by default. A share is created read-only unless `--write` is
+  passed, and old peers default to read-only on any missing `writable` field.
 
-## Non-goals (MVP)
+## Write access (shipped after MVP)
 
-- No write access / co-driving. No multi-hop relays. No scrollback history
-  transfer (viewer sees the live screen only). No delta frames. No persistence
-  of shares across restarts.
+Viewers of a writable share can type into the sharer's PTY. Design:
+
+- Same connection, bidirectional. The JoinShare socket — one-way in the MVP —
+  now also carries viewer→sharer `Input { data }` messages and sharer→viewer
+  `WriteStatus { writable }` (live grant/revoke). `writable` flags ride on
+  `ShareOffer`/`ShareAccepted`, `#[serde(default)] = false` for compat.
+- PTY writer stays main-thread-owned. The per-viewer stream thread spawns a
+  companion input-reader that only ever emits a `PeerEvent::ViewerInput` on the
+  existing mpsc; the TUI main loop maps token→pane, re-checks the writable
+  flag, rate-limits, sanitizes, and writes. Peer threads never touch a PTY.
+- Grant/revoke is an `Arc<AtomicBool>` shared between the sharer's
+  `OutgoingShare` and the registry `ShareEntry`; flipping it is picked up by
+  the stream loop within one poll and enforced at BOTH ends (input thread drops
+  input when read-only; main loop re-checks to win revoke races).
+- Input safety: the sharer sanitizes remote bytes down to the keyboard
+  repertoire before the PTY sees them — forged bracketed-paste guards
+  (`ESC[200~`/`ESC[201~`, numeric-param-aware), OSC/DCS/APC/PM/SOS strings
+  (response forgery like OSC 52), and C1 control codepoints are stripped;
+  allowed CSI/SS3 key sequences pass. Per-message (best-effort: write access is
+  already command execution). Bounded read (no unbounded `read_line`), per-
+  connection ingest rate cap, and a per-pane byte/sec budget on the main thread.
+- Key encoding: frames carry a mode trailer (`DECCKM`, bracketed-paste) so the
+  viewer's Term tracks the sharer's app modes and encodes arrows/keys correctly.
+- Echo: the frame poll bursts from ~10 fps to ~30 fps for ~1.5s after remote
+  input so keystrokes echo back quickly; no local echo/prediction (tailnet RTT
+  is already imperceptible).
+
+## Non-goals
+
+- No multi-hop relays. No scrollback history transfer (viewer sees the live
+  screen only). No delta frames. No persistence of shares across restarts.
+  No per-viewer write granularity (grant/revoke is per pane, all viewers).
 
 ## Test plan
 
